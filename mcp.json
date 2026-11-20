@@ -1,0 +1,36 @@
+{
+  "servers": {
+    "figma": {
+      "url": "https://mcp.figma.com/mcp",
+      "enabled": false,
+      "keywords": [
+        "figma",
+        "desain",
+        "design",
+        "ui",
+        "ux",
+        "frame",
+        "komponen",
+        "component",
+        "layout",
+        "mockup",
+        "screenshot"
+      ]
+    },
+    "canva": {
+      "url": "https://mcp.canva.com/mcp",
+      "keywords": [
+        "canva",
+        "desain",
+        "design",
+        "poster",
+        "presentasi",
+        "slide",
+        "template",
+        "feed",
+        "konten",
+        "brand"
+      ]
+    }
+  }
+}

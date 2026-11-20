@@ -1,0 +1,18 @@
+# rahasia tidak boleh masuk image; konfigurasi diberikan lewat env_file/secret CI/CD
+.env
+.env.*
+
+# hasil build, data runtime, dan file yang tidak dibutuhkan untuk build
+.git
+.vscode
+.idea
+bin/
+logs/
+skills/
+docs/
+docker/
+founder-pricing/
+*.md
+Dockerfile
+docker-compose.yml
+.dockerignore

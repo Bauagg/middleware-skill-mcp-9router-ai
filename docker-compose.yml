@@ -1,0 +1,60 @@
+# Middleware skill untuk 9Router, dijalankan di VPS.
+#
+#   docker compose up -d --build     # build dari kode di folder ini lalu jalankan
+#   docker compose pull && docker compose up -d   # bila image dibuat CI/CD (DOCKER_IMAGE)
+#   docker compose logs -f middleware
+#
+# Konfigurasi diambil dari .env di folder yang sama (lihat docs/08-konfigurasi.md).
+
+name: middleware-skill-ai
+
+services:
+  middleware:
+    build: .
+    image: ${DOCKER_IMAGE:-middleware-skill-ai:latest}
+    container_name: middleware-skill-ai
+    restart: unless-stopped
+
+    env_file: .env
+    # nilai berikut selalu menang atas .env, supaya isi .env untuk development
+    # (APP_ENV=development, PATH_FILE_UPLOAD=skills, ...) tidak terbawa ke container
+    environment:
+      APP_ENV: production
+      GIN_MODE: release
+      PORT: "4000"
+      PATH_FILE_UPLOAD: /app/skills
+      LOG_DIR: /app/logs
+      MCP_CONFIG_PATH: /app/mcp.json
+
+    # API /api/* tidak memakai autentikasi, jadi bawaannya hanya bisa diakses
+    # dari VPS sendiri (127.0.0.1); buka ke publik lewat NGINX. Ubah lewat
+    # DOCKER_PORT_BIND di .env (mis. 0.0.0.0:4000 untuk membuka langsung).
+    ports:
+      - "${DOCKER_PORT_BIND:-127.0.0.1:4000}:4000"
+
+    # di Linux, host.docker.internal tidak ada otomatis; baris ini membuatnya
+    # menunjuk ke VPS, supaya REDIS_ADDR=host.docker.internal:6379 dan DB di
+    # VPS yang sama bisa dijangkau dari container
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      - skills_data:/app/skills # skill hasil upload tidak hilang saat container dibuat ulang
+      - logs_data:/app/logs
+      # daftar server MCP (Figma, Canva, ...); file harus ada sebelum compose
+      # dijalankan, perubahan berlaku setelah restart
+      - ./mcp.json:/app/mcp.json:ro
+
+    # server diberi waktu menyelesaikan request yang sedang berjalan (termasuk
+    # streaming) dan menulis sisa log pemakaian sebelum dihentikan paksa
+    stop_grace_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  skills_data:
+  logs_data:

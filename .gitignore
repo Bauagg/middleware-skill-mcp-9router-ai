@@ -1,0 +1,30 @@
+# Binaries
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Env
+.env
+
+# Logs
+logs/*.log
+
+# Folder skill (dibuat otomatis saat server start, isinya tidak di-commit).
+# Garis miring di depan: hanya folder skills/ di root, bukan folder lain yang
+# kebetulan bernama sama.
+/skills/
+
+# Go workspace / vendor
+vendor/
+go.work
+go.work.sum
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
