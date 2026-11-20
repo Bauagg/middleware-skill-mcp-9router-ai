@@ -40,16 +40,19 @@ middleware-skill-ai/
 │   │   ├── skillstore/           # upload, daftar, dan Render skill (bersihkan, budget, SHORT.md); preview
 │   │   ├── skillindex/           # index skill di memori, pemilih skill (BM25), skill aktif percakapan, watcher
 │   │   ├── skillcache/           # cache Redis: skill aktif per percakapan + hasil seleksi
-│   │   ├── proxy/                # proxy /v1/* + penyisipan skill, context pack, dan catatan di chat/completions
+│   │   ├── proxy/                # proxy /v1/* + penyisipan skill, context pack, catatan, dan putaran tool MCP di chat/completions
 │   │   ├── skillfallback/        # pemilih cadangan: model 9Router memilih skill saat skor ambigu
 │   │   ├── eval/                 # eval skill: EVAL.yaml -> jawaban model -> skor hakim -> t_eval_runs
 │   │   ├── contextpack/          # context pack (m_context_packs): ringkasan tetap yang selalu disisipkan
 │   │   ├── memorynote/           # catatan memori (t_memory_notes): ekstraksi, konfirmasi, pencarian teks
+│   │   ├── mcp/                  # koneksi MCP (Canva, ...): mcp.json, login OAuth (m_mcp_credentials), pilih & jalankan tool
 │   │   └── usagelog/             # log pemakaian di PostgreSQL (t_usage_logs) + GET /api/usage-logs
 │   ├── clients/                  # klien layanan pihak ketiga, satu file per layanan
 │   │   ├── 9router.go            # koneksi ke 9Router (reverse proxy, timeout, format error, pengamatan token)
 │   │   ├── redis.go              # koneksi Redis (timeout pendek, gagal = cache miss)
-│   │   └── embedding.go          # klien embedding umum (POST /embeddings: 9Router, Ollama, dll.)
+│   │   ├── embedding.go          # klien embedding umum (POST /embeddings: 9Router, Ollama, dll.)
+│   │   ├── mcp.go                # klien server MCP (Streamable HTTP, SDK resmi go-sdk): daftar & panggil tool
+│   │   └── mcpauth.go            # discovery OAuth server MCP + pendaftaran klien otomatis (DCR)
 │   └── pkg/                      # pustaka bersama, tidak tahu soal domain
 │       ├── response/             # Amplop {status,message,data,errors}
 │       ├── apperror/             # AppError + Handle + BindingErrors
@@ -60,7 +63,8 @@ middleware-skill-ai/
 │       ├── skillclean/           # pembersih isi SKILL.md dari bagian khusus Claude (aturan mudah ditambah)
 │       ├── modelbudget/          # budget token per model (pola nama model -> token)
 │       ├── uuidparam/            # validasi parameter path :id berformat UUID (400 bila bukan)
-│       └── vector/               # kemiripan kosinus untuk seleksi embedding
+│       ├── vector/               # kemiripan kosinus untuk seleksi embedding
+│       └── secretbox/            # enkripsi AES-256-GCM untuk token login MCP di database
 ├── docker/redis-dev/             # Redis DEV (docker compose) untuk dijalankan di VPS, port 6380
 ├── docs/                         # dokumentasi lengkap (mulai dari docs/README.md)
 ├── Dockerfile                    # image middleware (build 2 tahap, user non-root, healthcheck)
@@ -139,6 +143,9 @@ Bila port 6380 tidak bisa dijangkau setelah container jalan, buka port itu di fi
 | GET | `/api/evals/runs/:id?detail=true` | Hasil eval per varian beserta kesimpulannya |
 | GET | `/api/mcp/servers` | Status server MCP (Canva, Figma, ...) dan link login |
 | GET | `/api/mcp/servers/:name/connect` | Login OAuth server MCP (buka di browser) |
+| POST | `/api/mcp/servers/:name/refresh` | Ambil ulang daftar tool server MCP |
+| DELETE | `/api/mcp/servers/:name/connection` | Hapus login server MCP |
+| GET | `/api/mcp/oauth/callback` | Tujuan balik setelah login OAuth (dipanggil browser) |
 | GET | `/api/mcp/tools?q=` | Tool MCP yang terhubung dan yang akan terpilih untuk sebuah pesan |
 | GET | `/api/context-packs` | Daftar context pack |
 | POST | `/api/context-packs` | Buat context pack, body `{"name","content","active"}` |
@@ -361,6 +368,57 @@ Catatan:
 - Pencarian catatan dibatasi `MEMORY_LOOKUP_TIMEOUT`. Bila lewat atau database gagal, request jalan tanpa catatan (gagal terbuka).
 - Ekstraksi yang berjalan bersamaan dibatasi `MEMORY_EXTRACT_CONCURRENCY`. Bila antrean penuh, ekstraksi dilewati. Biaya token ekstraksi dicatat di log aplikasi (`ekstraksi memori selesai`).
 - `MEMORY_EXTRACT_MODEL` kosong = ekstraksi mati, tetapi catatan manual dan penyisipan tetap berjalan. `MEMORY_MAX_NOTES=0` mematikan penyisipan catatan.
+
+## MCP (Canva, Figma, dan lainnya)
+
+MCP (Model Context Protocol) memberi model akses ke aplikasi lain, misalnya mencari atau membuat desain di Canva. 9Router tidak bisa terhubung ke server MCP, jadi **middleware yang menjadi klien MCP**. Model di 9Router mendukung tool calling (sudah diuji dengan `AI-Crypro`): model meminta "panggil tool X", lalu middleware yang menjalankannya.
+
+```
+Client ──chat──▶ middleware ──(chat + tool yang cocok)──▶ 9Router ──▶ model
+                    ▲  │                                              │
+                    │  └──▶ server MCP (Canva, ...) ◀── "panggil tool" ┘
+                    │            │
+                    └── jawaban akhir ◀── model ◀── 9Router ◀── hasil tool
+```
+
+**1. Daftarkan server** di `mcp.json`. File ini tanpa rahasia dan boleh di-commit; perubahan berlaku setelah restart.
+
+```json
+{
+  "servers": {
+    "canva": { "url": "https://mcp.canva.com/mcp", "keywords": ["canva", "desain", "poster"] },
+    "tokoku": { "url": "https://mcp.tokoku.example/mcp", "headers": { "Authorization": "Bearer ${TOKOKU_TOKEN}" } }
+  }
+}
+```
+
+- `keywords`: kata yang ikut dicocokkan dengan pesan user saat memilih tool.
+- `headers`: untuk server ber-API key. `${NAMA_ENV}` diambil dari `.env`, supaya rahasia tidak tertulis di `mcp.json`.
+- `"enabled": false` mematikan sebuah server.
+- Yang didukung hanya server MCP HTTP (Streamable HTTP), bukan server lokal `npx`/stdio.
+
+**2. Login sekali per server (OAuth)**: buka `http://<BASE_URL>/api/mcp/servers/canva/connect` di browser, lalu login dan setujui akses. Middleware otomatis mencari alamat login, mendaftarkan dirinya sebagai aplikasi OAuth, dan memakai PKCE. Akun yang dipakai adalah **satu akun bersama** untuk semua chat. Token disimpan terenkripsi (`MCP_TOKEN_KEY`) di `m_mcp_credentials` dan diperpanjang otomatis. `BASE_URL` harus bisa dibuka dari browser, karena halaman login kembali ke `BASE_URL/api/mcp/oauth/callback`.
+
+**3. Setelah itu berjalan sendiri di setiap chat:**
+- Tool dipilih **otomatis sesuai pesan** (BM25 pada nama server, `keywords`, nama dan deskripsi tool, dari dua pesan user terakhir). Maksimal `MCP_MAX_TOOLS` tool dengan skor ≥ `MCP_TOOL_MIN_SCORE`.
+- Pesan yang tidak menyinggung tool apa pun ("halo") diteruskan biasa tanpa tool dan tanpa tambahan token.
+- Bila model meminta tool, middleware menjalankannya (bersamaan, batas `MCP_TOOL_TIMEOUT`), memberikan hasilnya ke model, dan mengulanginya sampai ada jawaban akhir (maks `MCP_MAX_STEPS` putaran).
+- **Semua tool diizinkan**, termasuk yang mengubah data. Pakai akun yang aman untuk diubah.
+- Bila client sudah membawa `tools` sendiri, tool MCP tidak ditambahkan.
+
+```bash
+curl http://localhost:4000/api/mcp/servers                                        # status + link login
+curl "http://localhost:4000/api/mcp/tools?q=buatkan+poster+promo+di+canva"        # tool yang akan terpilih
+```
+
+Catatan:
+- Chat yang memakai tool kira-kira **2x lebih lambat dan mahal**, karena model dipanggil minimal dua kali. Hasil uji: sekitar 7,5 detik dan sekitar 5.500 token prompt. Usage di respons adalah jumlah semua putaran.
+- Untuk client streaming, jawaban dikirim **sekaligus di akhir** (bukan per kata). Selama tool berjalan, client menerima komentar SSE `: keepalive` supaya koneksi tidak putus.
+- Tool yang gagal tidak menggagalkan chat: model menerima `ERROR: ...` dan menjelaskannya. Hasil berupa gambar hanya disebutkan, tidak bisa dilihat model.
+- **Figma:** server MCP resminya menolak pendaftaran klien (`403`, hanya aplikasi yang disetujui Figma), jadi `figma` di `mcp.json` diset `enabled: false`. Alternatifnya, jalankan server MCP Figma pihak ketiga yang memakai personal access token sebagai layanan HTTP terpisah.
+- Respons yang membawa tool diberi header `X-MCP-Tools`. Pemakaian tool dicatat di `t_usage_logs` (`mcp_tools_offered`, `mcp_tool_calls`, `mcp_tool_names`, `mcp_steps`) dan diringkas di bagian `mcp` pada `/api/usage-logs/summary`.
+
+Penjelasan lengkap: [`docs/10-mcp.md`](docs/10-mcp.md).
 
 ## Index Skill
 
