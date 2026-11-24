@@ -27,6 +27,12 @@ services:
       MCP_CONFIG_PATH: /app/mcp.json
       IMAGE_PATH: /app/images
       WEB_SEARCH_URL: http://searxng:8080
+      # pasang MCP dari GitHub: Docker API lewat proxy yang hanya membuka urusan
+      # container, dan container MCP di network khusus middleware_mcp_net
+      MCP_DOCKER_HOST: tcp://docker-proxy:2375
+      MCP_DOCKER_NETWORK: middleware_mcp_net
+      MCP_REPOS_PATH: /app/open_source_mcp
+      MCP_RUNNER_PUBLISH_HOST: ""
 
     # API /api/* tidak memakai autentikasi, jadi bawaannya hanya bisa diakses
     # dari VPS sendiri (127.0.0.1); buka ke publik lewat NGINX. Ubah lewat
@@ -44,12 +50,26 @@ services:
       - skills_data:/app/skills # skill hasil upload tidak hilang saat container dibuat ulang
       - logs_data:/app/logs
       - images_data:/app/images # gambar hasil generate lewat chat
+      - mcp_repos_data:/app/open_source_mcp # clone repo MCP dari GitHub (untuk diperiksa)
       # server MCP bawaan untuk semua user (Canva, ...). Server tambahan tiap user
       # disimpan di database, jadi file ini cukup read-only. Perubahan butuh restart.
       - ./mcp.json:/app/mcp.json:ro
 
     depends_on:
-      - searxng
+      searxng:
+        condition: service_started
+      docker-proxy:
+        condition: service_started
+      # image runner harus sudah dibangun sebelum MCP pertama dijalankan
+      mcp-runner:
+        condition: service_completed_successfully
+
+    # default: searxng dan internet; mcp_net: menjangkau container MCP;
+    # docker_api: satu-satunya jalan ke Docker (lewat proxy)
+    networks:
+      - default
+      - mcp_net
+      - docker_api
 
     # server diberi waktu menyelesaikan request yang sedang berjalan (termasuk
     # streaming) dan menulis sisa log pemakaian sebelum dihentikan paksa
@@ -80,7 +100,53 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # proxy Docker API untuk middleware: hanya membuka urusan container (buat,
+  # jalankan, hentikan, hapus, periksa, log). Exec, image, volume, network,
+  # build, swarm, dan lainnya ditutup. Socket Docker hanya dipasang di sini,
+  # tidak pernah di container middleware atau container MCP. Network docker_api
+  # internal: tidak bisa diakses dari luar maupun dari container MCP.
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: middleware-docker-proxy
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      POST: 1
+      ALLOW_START: 1
+      ALLOW_STOP: 1
+      ALLOW_RESTARTS: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker_api
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # hanya membangun image runner untuk MCP dari GitHub (git, Node 22, pnpm,
+  # Python, uv, supergateway), lalu langsung selesai. Container MCP dibuat
+  # middleware dari image ini.
+  mcp-runner:
+    build: ./docker/mcp-runner
+    image: ${MCP_RUNNER_IMAGE:-middleware-mcp-runner:latest}
+    command: ["true"]
+    restart: "no"
+    network_mode: none
+
+networks:
+  default:
+  # container MCP dari GitHub hanya tersambung ke network ini (bukan ke
+  # default/docker_api), jadi tidak bisa menjangkau searxng atau Docker API
+  mcp_net:
+    name: middleware_mcp_net
+    driver: bridge
+  docker_api:
+    internal: true
+
 volumes:
   skills_data:
   logs_data:
   images_data:
+  mcp_repos_data:

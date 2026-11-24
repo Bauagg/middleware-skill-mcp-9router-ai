@@ -179,6 +179,16 @@ type MCPConfig struct {
 	ToolTimeout     time.Duration // MCP_TOOL_TIMEOUT: batas waktu satu pemanggilan tool
 	ResultMaxTokens int           // MCP_TOOL_RESULT_MAX_TOKENS: batas token hasil satu tool yang diberikan ke model
 	RefreshInterval time.Duration // MCP_REFRESH_INTERVAL: seberapa sering daftar tool diambil ulang (0 = hanya saat start/login)
+
+	// --- pasang MCP dari GitHub (container terpisah) ---
+	ReposPath          string        // MCP_REPOS_PATH: folder clone repo (open_source_mcp)
+	DockerHost         string        // MCP_DOCKER_HOST: alamat Docker API (kosong = fitur mati)
+	DockerNetwork      string        // MCP_DOCKER_NETWORK: network khusus container MCP
+	RunnerImage        string        // MCP_RUNNER_IMAGE: image runner (git, Node, Python, supergateway)
+	RunnerPublishHost  string        // MCP_RUNNER_PUBLISH_HOST: mis. 127.0.0.1 bila middleware tidak di Docker
+	RunnerMemoryMB     int           // MCP_RUNNER_MEMORY_MB: batas memori per container
+	RunnerCPUs         float64       // MCP_RUNNER_CPUS: batas CPU per container
+	RunnerStartTimeout time.Duration // MCP_RUNNER_START_TIMEOUT: batas clone + install + siap
 }
 
 // ImageConfig berisi pengaturan pembuat gambar lewat chat (tool generate_image).
@@ -519,6 +529,24 @@ func loadMCPConfig() (MCPConfig, error) {
 	}
 	if c.RefreshInterval, err = getEnvDuration("MCP_REFRESH_INTERVAL", 30*time.Minute); err != nil {
 		return c, err
+	}
+
+	c.ReposPath = strings.TrimSpace(getEnv("MCP_REPOS_PATH", "open_source_mcp"))
+	c.DockerHost = strings.TrimSpace(getEnv("MCP_DOCKER_HOST", ""))
+	c.DockerNetwork = strings.TrimSpace(getEnv("MCP_DOCKER_NETWORK", "middleware_mcp_net"))
+	c.RunnerImage = strings.TrimSpace(getEnv("MCP_RUNNER_IMAGE", "middleware-mcp-runner:latest"))
+	c.RunnerPublishHost = strings.TrimSpace(getEnv("MCP_RUNNER_PUBLISH_HOST", ""))
+	if c.RunnerMemoryMB, err = getEnvInt("MCP_RUNNER_MEMORY_MB", 1024); err != nil {
+		return c, err
+	}
+	if c.RunnerCPUs, err = getEnvFloat("MCP_RUNNER_CPUS", 1); err != nil {
+		return c, err
+	}
+	if c.RunnerStartTimeout, err = getEnvDuration("MCP_RUNNER_START_TIMEOUT", 10*time.Minute); err != nil {
+		return c, err
+	}
+	if c.RunnerMemoryMB < 128 || c.RunnerCPUs <= 0 || c.RunnerStartTimeout <= 0 {
+		return c, fmt.Errorf("MCP_RUNNER_MEMORY_MB minimal 128, MCP_RUNNER_CPUS dan MCP_RUNNER_START_TIMEOUT harus > 0")
 	}
 
 	if c.MaxTools < 0 || c.MaxSteps < 0 || c.ResultMaxTokens < 0 {

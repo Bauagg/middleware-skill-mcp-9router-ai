@@ -45,14 +45,24 @@ type Credential struct {
 func (Credential) TableName() string { return "m_mcp_credentials" }
 
 // UserServer adalah satu baris tabel m_mcp_servers: server MCP yang ditambahkan
-// seorang user (lewat chat atau API) dan hanya terlihat oleh user itu. Server
-// bawaan untuk semua user ada di mcp.json.
+// lewat chat atau API. Buatan user biasa hanya terlihat oleh user itu. Buatan
+// admin (Global) berlaku untuk SEMUA user, karena admin yang mengatur
+// middleware. Server bawaan dari file ada di mcp.json.
 type UserServer struct {
 	ID       string `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	UserID   string `json:"user_id" gorm:"size:128;not null;uniqueIndex:idx_m_mcp_servers_user_name,priority:1"`
 	Name     string `json:"name" gorm:"size:40;not null;uniqueIndex:idx_m_mcp_servers_user_name,priority:2"`
 	URL      string `json:"url" gorm:"type:text;not null"`
 	Keywords string `json:"keywords" gorm:"type:text"` // daftar kata, JSON array
+
+	// Global: dibuat admin, terlihat oleh semua user (UserID = admin pembuatnya).
+	Global bool `json:"global" gorm:"not null;default:false;index"`
+	// SharedLogin (hanya untuk Global): semua user memakai login admin pembuatnya,
+	// mis. GitHub/database organisasi. false = tiap user login ke akunnya sendiri.
+	SharedLogin bool `json:"shared_login" gorm:"not null;default:false"`
+	// Installed: server hasil clone GitHub yang berjalan di container (diurus
+	// lewat m_mcp_installs); dihapus lewat pengelola install, bukan di sini.
+	Installed bool `json:"installed" gorm:"not null;default:false"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`

@@ -37,7 +37,7 @@ Key itu dipakai untuk **semua** panggilan ke 9Router selama chat tersebut: jawab
 
 Aplikasi pihak ketiga (mis. Luma) mengirim identitas user di header **`X-User-Id`** (huruf, angka, `. _ @ : -`, maks 128). User yang login di middleware tidak perlu header ini: `user_id`-nya diambil dari token, dan header `X-User-Id` diabaikan. Semua data per user dipisah berdasarkan `user_id`.
 
-**Role:** admin (pemilik aplikasi, lihat [Akun dan login](12-akun-dan-login.md)) melihat dan mengelola data **semua** user di endpoint `/api/*`. User biasa, termasuk semua user dari pihak ketiga, hanya melihat miliknya. Skill selalu global.
+**Role:** admin (pemilik aplikasi, lihat [Akun dan login](12-akun-dan-login.md)) melihat dan mengelola data **semua** user di endpoint `/api/*`. User biasa, termasuk semua user dari pihak ketiga, hanya melihat miliknya. Skill dan server MCP buatan admin selalu global (berlaku untuk semua user).
 
 | Endpoint | `X-User-Id` |
 |---|---|
@@ -169,13 +169,17 @@ curl -X POST http://localhost:4000/api/memory-notes -H "Content-Type: applicatio
 | Method | URL | Keterangan |
 |---|---|---|
 | GET | `/api/mcp/servers` | Server bawaan + milik user beserta status koneksi user: `state`, `own`, jumlah tool, sudah login, `connect_url` (link login bertanda tangan) |
-| POST | `/api/mcp/servers` | Tambah server milik user: `{"name","url","keywords"}` (URL dicek dulu) |
-| DELETE | `/api/mcp/servers/:name` | Hapus server milik user beserta login-nya |
+| POST | `/api/mcp/servers` | Tambah server: `{"name","url","keywords","shared_login"}` (URL dicek dulu). Dari admin = berlaku untuk **semua user** (`shared_login: true` = semua memakai login admin); dari user biasa = pribadi |
+| DELETE | `/api/mcp/servers/:name` | Hapus server pribadi beserta login-nya. Server dari admin hanya bisa dihapus admin (hilang untuk semua user) |
 | GET | `/api/mcp/servers/:name/connect` | Buka di **browser**: mengarahkan ke halaman login server (OAuth). `?redirect=false` mengembalikan `auth_url` sebagai JSON. |
 | GET | `/api/mcp/oauth/callback` | Tujuan balik setelah login (dipanggil browser, membalas halaman HTML) |
 | POST | `/api/mcp/servers/:name/refresh` | Ambil ulang daftar tool server |
 | DELETE | `/api/mcp/servers/:name/connection` | Hapus token login server |
 | GET | `/api/mcp/tools?q=&limit=` | Semua tool yang terhubung. Dengan `q`: skor tiap tool dan mana yang `selected` untuk pesan itu. |
+
+## Pasang MCP dari GitHub
+
+`/api/mcp/installs`: analyze, ajukan, setujui/tolak (admin), start/stop, hapus, log, dan form data rahasia. Daftar lengkap: [Pasang MCP dari GitHub](13-pasang-mcp-dari-github.md#api).
 
 ## Gambar
 

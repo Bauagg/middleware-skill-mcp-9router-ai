@@ -39,6 +39,8 @@ middleware-skill-ai/
 | `eval/` | Mengukur kualitas skill (full vs short vs tanpa skill) | `t_eval_runs` |
 | `contextpack/` | Context pack: ringkasan tetap yang selalu disisipkan | `m_context_packs` |
 | `memorynote/` | Catatan memori: ekstraksi, konfirmasi, pencarian teks | `t_memory_notes` |
+| `auth/` | Register, login, refresh token, dan akun admin dari `ADMIN_EMAIL` | `m_users` |
+| `mcpinstall/` | Pasang MCP dari GitHub lewat chat: analisis repo, persetujuan admin, form data rahasia, container Docker | `m_mcp_installs` (clone di `open_source_mcp/`) |
 | `imagegen/` | Tool bawaan `generate_image`: membuat gambar lewat chat, menyimpan, dan menyajikannya di `/images/<nama>` | `t_generated_images` (file di `images/`) |
 | `mcp/` | Koneksi ke server MCP: daftar server dari `mcp.json`, login OAuth, index dan pemilihan tool, pemanggilan tool | `m_mcp_credentials` |
 

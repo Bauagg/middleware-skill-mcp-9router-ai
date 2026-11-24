@@ -7,6 +7,9 @@ import "github.com/Bauagg/middleware-skill-ai/internal/pkg/jwtauth"
 type RegisterInput struct {
 	Email    string `json:"email" binding:"required,email,max=254"`
 	Password string `json:"password" binding:"required,min=8,max=72"`
+	// sengaja tanpa field role: register selalu menghasilkan user. Admin dibuat
+	// langsung di database (atau ADMIN_EMAIL), supaya tidak ada yang bisa
+	// mendaftar sendiri sebagai admin lewat endpoint terbuka ini.
 }
 
 // LoginInput adalah body POST /api/auth/login.

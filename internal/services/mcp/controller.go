@@ -48,7 +48,7 @@ func (h *Controller) AddServer(c *gin.Context) {
 		apperror.Handle(c, apperror.NewBadRequest("Validasi gagal", apperror.BindingErrors(err)...))
 		return
 	}
-	st, note, err := h.service.AddServer(c.Request.Context(), userOf(c), in.Name, in.URL, in.Keywords)
+	st, note, err := h.service.AddServer(c.Request.Context(), userOf(c), in.Name, in.URL, in.Keywords, in.SharedLogin)
 	if err != nil {
 		apperror.Handle(c, apperror.NewBadRequest(err.Error()))
 		return

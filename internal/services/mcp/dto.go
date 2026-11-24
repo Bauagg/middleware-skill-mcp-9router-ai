@@ -32,7 +32,9 @@ func (c ServerConfig) IsEnabled() bool { return c.Enabled == nil || *c.Enabled }
 type ServerStatus struct {
 	Name          string     `json:"name"`
 	URL           string     `json:"url"`
-	Own           bool       `json:"own"` // true = ditambahkan user ini; false = bawaan mcp.json
+	Own           bool       `json:"own"`          // true = ditambahkan user ini sendiri
+	Global        bool       `json:"global"`       // true = dibuat admin, berlaku untuk semua user
+	SharedLogin   bool       `json:"shared_login"` // true = semua user memakai login admin
 	State         string     `json:"state"`
 	Error         string     `json:"error,omitempty"`
 	Tools         int        `json:"tools"`
@@ -76,6 +78,9 @@ type AddServerInput struct {
 	Name     string   `json:"name" binding:"required,max=40"`
 	URL      string   `json:"url" binding:"required,max=2000"`
 	Keywords []string `json:"keywords"`
+	// SharedLogin hanya berlaku bila yang menambah admin: true = semua user
+	// memakai login admin untuk server ini; false = tiap user login sendiri.
+	SharedLogin bool `json:"shared_login"`
 }
 
 // oauthState disimpan di Redis selama login berlangsung (state -> server + PKCE).

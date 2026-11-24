@@ -12,6 +12,7 @@ package router
 import (
 	"context"
 	"crypto/sha256"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -29,6 +30,7 @@ import (
 	"github.com/Bauagg/middleware-skill-ai/internal/services/eval"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/imagegen"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/mcp"
+	"github.com/Bauagg/middleware-skill-ai/internal/services/mcpinstall"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/memorynote"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/proxy"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/skillcache"
@@ -50,7 +52,7 @@ func Register(r *gin.Engine, db *gorm.DB, cfg *config.Config, tokens *jwtauth.Is
 		&usagelog.UsageLog{}, &eval.EvalRun{},
 		&contextpack.ContextPack{}, &memorynote.MemoryNote{},
 		&mcp.Credential{}, &mcp.UserServer{}, &imagegen.GeneratedImage{},
-		&auth.User{},
+		&auth.User{}, &mcpinstall.Install{}, &mcpinstall.Instance{},
 	); err != nil {
 		logger.Fatal("migrasi database gagal", zap.Error(err))
 	}
@@ -174,6 +176,13 @@ func Register(r *gin.Engine, db *gorm.DB, cfg *config.Config, tokens *jwtauth.Is
 	}
 	// bantu-sambung lewat chat: status server MCP (mcp.json) + link login
 	sources = append(sources, mcp.NewConnectTool(mcpService))
+
+	// pasang MCP dari GitHub lewat chat: clone ke open_source_mcp, persetujuan
+	// admin, data rahasia lewat form, lalu dijalankan di container terpisah
+	installService := newMCPInstall(cfg, db, mcpService)
+	mcpinstall.RegisterRoutes(api.Group("/mcp/installs"), mcpinstall.NewController(installService))
+	go installService.Run(context.Background())
+	sources = append(sources, mcpinstall.NewTool(installService))
 
 	// pencarian web lewat SearXNG (tool web_search) + endpoint cek /api/web-search
 	var searcher websearch.Searcher
@@ -299,6 +308,53 @@ func newMCP(cfg *config.Config, db *gorm.DB, kv mcp.KV) *mcp.Service {
 		BaseURL:         cfg.App.BaseURL,
 		LinkKey:         linkKey(cfg.MCP.TokenKey),
 	})
+}
+
+// newMCPInstall menyiapkan pemasangan MCP dari GitHub. Fitur hanya aktif bila
+// MCP_DOCKER_HOST dan MCP_TOKEN_KEY diisi; tanpa itu, chat menjawab bahwa
+// fitur belum diaktifkan.
+func newMCPInstall(cfg *config.Config, db *gorm.DB, reg mcpinstall.Registrar) *mcpinstall.Service {
+	if err := os.MkdirAll(cfg.MCP.ReposPath, 0o755); err != nil {
+		logger.Fatal("folder clone MCP tidak bisa dibuat", zap.String("path", cfg.MCP.ReposPath), zap.Error(err))
+	}
+	var docker mcpinstall.Containers
+	if cfg.MCP.DockerHost != "" {
+		d, err := clients.NewDocker(cfg.MCP.DockerHost)
+		if err != nil {
+			logger.Fatal("MCP_DOCKER_HOST tidak valid", zap.Error(err))
+		}
+		docker = d
+	}
+	var box *secretbox.Box
+	if cfg.MCP.TokenKey != "" {
+		b, err := secretbox.New(cfg.MCP.TokenKey)
+		if err != nil {
+			logger.Fatal("MCP_TOKEN_KEY tidak valid", zap.Error(err))
+		}
+		box = b
+	}
+	var key []byte
+	if cfg.MCP.TokenKey != "" {
+		sum := sha256.Sum256([]byte("mcp-env-link\x00" + cfg.MCP.TokenKey))
+		key = sum[:]
+	}
+	svc := mcpinstall.NewService(mcpinstall.NewRepository(db), docker, clients.NewGitHub(), reg, box, mcpinstall.Options{
+		ReposPath:    cfg.MCP.ReposPath,
+		Image:        cfg.MCP.RunnerImage,
+		Network:      cfg.MCP.DockerNetwork,
+		PublishHost:  cfg.MCP.RunnerPublishHost,
+		MemoryMB:     int64(cfg.MCP.RunnerMemoryMB),
+		CPUs:         cfg.MCP.RunnerCPUs,
+		StartTimeout: cfg.MCP.RunnerStartTimeout,
+		BaseURL:      cfg.App.BaseURL,
+		LinkKey:      key,
+	})
+	if svc.Enabled() {
+		logger.Info("pasang MCP dari GitHub aktif", zap.String("network", cfg.MCP.DockerNetwork), zap.String("image", cfg.MCP.RunnerImage))
+	} else {
+		logger.Info("pasang MCP dari GitHub mati (isi MCP_DOCKER_HOST dan MCP_TOKEN_KEY untuk mengaktifkan)")
+	}
+	return svc
 }
 
 // newEmbedder membuat klien embedding bila EMBEDDING_MODEL diisi; nil berarti

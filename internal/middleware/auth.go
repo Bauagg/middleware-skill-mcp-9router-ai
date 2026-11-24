@@ -112,6 +112,8 @@ func public(c *gin.Context) bool {
 		return true // dipanggil browser setelah login; user dibawa di state login
 	case strings.HasPrefix(p, "/api/mcp/servers/") && strings.HasSuffix(p, "/connect") && c.Query("sig") != "":
 		return true // link login bertanda tangan dari chat (diverifikasi di controller)
+	case strings.HasPrefix(p, "/api/mcp/installs/") && strings.HasSuffix(p, "/env") && c.Query("sig") != "":
+		return true // form data rahasia MCP dari link bertanda tangan (diverifikasi di controller)
 	case c.Request.Method == http.MethodPost &&
 		(p == "/api/auth/register" || p == "/api/auth/login" || p == "/api/auth/refresh"):
 		return true // web middleware AI mendaftar/login dari browser, belum punya token

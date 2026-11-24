@@ -45,6 +45,21 @@
 | `REDIS_DB` | `0` | |
 | `REDIS_TIMEOUT` | `200ms` | Batas waktu tiap operasi. Pakai `2s` bila Redis jauh, misalnya Redis DEV di VPS dari komputer lokal |
 
+## Pasang MCP dari GitHub
+
+| Variabel | Bawaan | Keterangan |
+|---|---|---|
+| `MCP_DOCKER_HOST` | kosong | Alamat Docker API. Kosong = fitur mati. Di docker-compose `tcp://docker-proxy:2375` |
+| `MCP_DOCKER_NETWORK` | `middleware_mcp_net` | Network khusus container MCP |
+| `MCP_REPOS_PATH` | `open_source_mcp` | Folder clone repo yang dianalisis |
+| `MCP_RUNNER_IMAGE` | `middleware-mcp-runner:latest` | Image runner (dari `docker/mcp-runner`) |
+| `MCP_RUNNER_PUBLISH_HOST` | kosong | Isi `127.0.0.1` bila middleware berjalan di luar Docker (laptop) |
+| `MCP_RUNNER_MEMORY_MB` | `1024` | Batas memori per container |
+| `MCP_RUNNER_CPUS` | `1` | Batas CPU per container |
+| `MCP_RUNNER_START_TIMEOUT` | `10m` | Batas clone + install sampai server siap |
+
+Juga butuh `MCP_TOKEN_KEY` (data rahasia disimpan terenkripsi). Lihat [Pasang MCP dari GitHub](13-pasang-mcp-dari-github.md).
+
 ## 9Router
 
 | Variabel | Bawaan | Keterangan |

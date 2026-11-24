@@ -104,10 +104,11 @@ func (r *Repository) DeleteCredential(ctx context.Context, userID, server string
 	return r.db.WithContext(ctx).Where("user_id = ? AND server = ?", userID, server).Delete(&Credential{}).Error
 }
 
-// ListUserServers mengambil server MCP milik user, terurut menurut nama.
+// ListUserServers mengambil server MCP pribadi milik user (bukan global),
+// terurut menurut nama.
 func (r *Repository) ListUserServers(ctx context.Context, userID string) ([]UserServer, error) {
 	var rows []UserServer
-	err := r.db.WithContext(ctx).Where("user_id = ?", userID).Order("name").Find(&rows).Error
+	err := r.db.WithContext(ctx).Where("user_id = ? AND global = ?", userID, false).Order("name").Find(&rows).Error
 	return rows, err
 }
 
@@ -128,6 +129,64 @@ func (r *Repository) AllConnections(ctx context.Context) ([]Connection, error) {
 	return rows, err
 }
 
+// ListGlobalServers mengambil server MCP buatan admin (berlaku untuk semua user).
+func (r *Repository) ListGlobalServers(ctx context.Context) ([]UserServer, error) {
+	var rows []UserServer
+	err := r.db.WithContext(ctx).Where("global = ?", true).Order("name").Find(&rows).Error
+	return rows, err
+}
+
+// NameTaken melaporkan apakah nama server sudah dipakai siapa pun (global
+// maupun pribadi). Server global tidak boleh bentrok dengan server user mana pun.
+func (r *Repository) NameTaken(ctx context.Context, name string) (bool, error) {
+	var n int64
+	err := r.db.WithContext(ctx).Model(&UserServer{}).Where("name = ?", name).Count(&n).Error
+	return n > 0, err
+}
+
+// DeleteGlobalServer menghapus server global (buatan admin).
+func (r *Repository) DeleteGlobalServer(ctx context.Context, name string) (int64, error) {
+	res := r.db.WithContext(ctx).Where("global = ? AND name = ?", true, name).Delete(&UserServer{})
+	return res.RowsAffected, res.Error
+}
+
+// DeleteCredentialsByServer menghapus login SEMUA user untuk satu server.
+func (r *Repository) DeleteCredentialsByServer(ctx context.Context, server string) error {
+	return r.db.WithContext(ctx).Where("server = ?", server).Delete(&Credential{}).Error
+}
+
+// ReplaceServer mengganti pendaftaran server milik userID bernama sama
+// (dipakai server hasil install yang alamatnya bisa berubah setelah restart).
+func (r *Repository) ReplaceServer(ctx context.Context, row *UserServer) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// server yang ditambahkan user sendiri (bukan hasil install) tidak ditimpa
+		var manual int64
+		if err := tx.Model(&UserServer{}).Where("user_id = ? AND name = ? AND installed = ?", row.UserID, row.Name, false).
+			Count(&manual).Error; err != nil {
+			return err
+		}
+		if manual > 0 {
+			return fmt.Errorf("user sudah punya server MCP bernama %q; hapus dulu server itu", row.Name)
+		}
+		if err := tx.Where("user_id = ? AND name = ? AND installed = ?", row.UserID, row.Name, true).Delete(&UserServer{}).Error; err != nil {
+			return err
+		}
+		return tx.Create(row).Error
+	})
+}
+
+// DeleteServer menghapus server milik userID bernama name (global maupun pribadi).
+func (r *Repository) DeleteServer(ctx context.Context, userID, name string) error {
+	return r.db.WithContext(ctx).Where("user_id = ? AND name = ?", userID, name).Delete(&UserServer{}).Error
+}
+
+// IsInstalled melaporkan apakah server bernama name berasal dari install GitHub.
+func (r *Repository) IsInstalled(ctx context.Context, name string) (bool, error) {
+	var n int64
+	err := r.db.WithContext(ctx).Model(&UserServer{}).Where("name = ? AND installed = ?", name, true).Count(&n).Error
+	return n > 0, err
+}
+
 // CreateUserServer menyimpan server MCP milik user.
 func (r *Repository) CreateUserServer(ctx context.Context, row *UserServer) error {
 	return r.db.WithContext(ctx).Create(row).Error
@@ -135,7 +194,7 @@ func (r *Repository) CreateUserServer(ctx context.Context, row *UserServer) erro
 
 // DeleteUserServer menghapus server MCP milik user.
 func (r *Repository) DeleteUserServer(ctx context.Context, userID, name string) (int64, error) {
-	res := r.db.WithContext(ctx).Where("user_id = ? AND name = ?", userID, name).Delete(&UserServer{})
+	res := r.db.WithContext(ctx).Where("user_id = ? AND name = ? AND global = ?", userID, name, false).Delete(&UserServer{})
 	return res.RowsAffected, res.Error
 }
 

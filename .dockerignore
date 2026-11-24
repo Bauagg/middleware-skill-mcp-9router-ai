@@ -10,6 +10,7 @@ bin/
 logs/
 skills/
 images/
+open_source_mcp/
 docs/
 docker/
 searxng/

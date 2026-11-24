@@ -161,3 +161,17 @@ go build -o bin/server ./cmd/server
 | Chat dijawab **401** `header X-Router-Key wajib diisi` | Client belum mengirim key 9Router milik user | Kirim header `X-Router-Key` berisi key 9Router user |
 | Chat dijawab **400** `field model wajib diisi` | Body chat tidak membawa `model` | Kirim `model` (mis. `AI-Crypro`) |
 | Catatan memori tidak pernah muncul sebagai `proposed` | `MEMORY_EXTRACT_ENABLED=false`, atau pesan tidak berisi kata sinyal hasil | Set `MEMORY_EXTRACT_ENABLED=true`; cek log aplikasi `ekstraksi memori` |
+
+## Service tambahan untuk pasang MCP dari GitHub
+
+`docker compose up -d --build` juga menyiapkan:
+
+| Service / bagian | Fungsi |
+|---|---|
+| `mcp-runner` | Hanya membangun image `middleware-mcp-runner:latest` (git, Node 22, pnpm, Python, uv, supergateway), lalu selesai |
+| `docker-proxy` | Proxy Docker API yang hanya membuka urusan container. Satu-satunya yang memasang `/var/run/docker.sock` |
+| network `middleware_mcp_net` | Tempat container `mcpx-<nama>`; middleware ikut tersambung untuk memanggilnya |
+| network `docker_api` (internal) | Penghubung middleware dan docker-proxy saja |
+| volume `mcp_repos_data` | Isi `open_source_mcp` (clone repo yang dianalisis) |
+
+Container MCP yang dibuat lewat chat **tidak** dikelola docker-compose. Melihatnya: `docker ps --filter label=managed-by=middleware-skill-ai`. Bila `docker-proxy` gagal start karena SELinux/AppArmor, tambahkan `privileged: true` pada service itu (sesuai README proxy).

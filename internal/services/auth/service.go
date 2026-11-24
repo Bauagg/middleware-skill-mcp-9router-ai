@@ -52,7 +52,8 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (*AuthResult, 
 	if err != nil {
 		return nil, err
 	}
-	// role selalu user: admin hanya dibuat dari ADMIN_EMAIL/ADMIN_PASSWORD di .env
+	// role selalu user: field role di body diabaikan. Admin dibuat langsung di
+	// database (UPDATE m_users SET role = 'admin') atau dari ADMIN_EMAIL di .env
 	row := &User{Email: email, Password: string(hash), Role: userctx.RoleUser}
 	if err := s.repo.Create(ctx, row); err != nil {
 		return nil, err // email ganda (balapan) dipetakan apperror.Handle menjadi 409

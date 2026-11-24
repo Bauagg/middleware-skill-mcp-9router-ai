@@ -23,10 +23,36 @@ Setiap user (header `X-User-Id`) punya koneksi MCP **sendiri**:
 | | Berlaku untuk | Disimpan di |
 |---|---|---|
 | **Server bawaan** (mis. Canva) | semua user (masing-masing tetap login ke akunnya sendiri) | `mcp.json` (diatur admin, butuh restart) |
-| **Server tambahan** (mis. Notion yang ditambah lewat chat) | hanya user yang menambahkannya | tabel `m_mcp_servers` (langsung aktif) |
+| **Server dari admin** (ditambah admin lewat chat atau API) | **semua user**: login bersama milik admin, atau login masing-masing (dipilih admin per server) | tabel `m_mcp_servers`, `global = true` (langsung aktif, tanpa restart) |
+| **Server tambahan user** (mis. Notion yang ditambah user biasa lewat chat) | hanya user yang menambahkannya | tabel `m_mcp_servers`, `global = false` (langsung aktif) |
 | **Login / token** | per (user, server) | tabel `m_mcp_credentials`, terenkripsi `MCP_TOKEN_KEY` |
 
-Koneksi dan daftar tool dibuat per (user, server) saat pertama dipakai. Koneksi yang tidak dipakai selama 1 jam ditutup otomatis. Tool server milik user A **tidak pernah** ditawarkan atau dijalankan di chat user B.
+Koneksi dan daftar tool dibuat per (user, server) saat pertama dipakai, kecuali server admin dengan login bersama: semua user memakai **satu** koneksi milik admin. Koneksi yang tidak dipakai selama 1 jam ditutup otomatis. Tool server milik user A **tidak pernah** ditawarkan atau dijalankan di chat user B.
+
+## Server dari admin (untuk semua user)
+
+Admin adalah pemilik yang mengatur middleware, jadi server MCP yang **ditambahkan admin** (lewat chat `add_mcp_server` atau `POST /api/mcp/servers`) langsung berlaku untuk **semua user**, sama seperti skill. Saat menambah, admin memilih `shared_login`:
+
+| `shared_login` | Cocok untuk | Yang terjadi |
+|---|---|---|
+| `true` | Akun organisasi: GitHub perusahaan, database, layanan internal | Semua user memakai **login admin**. Hanya admin pembuatnya yang bisa login/logout; user lain tidak diberi link login dan ditolak 403 bila mencoba. |
+| `false` (bawaan) | Akun pribadi: Canva, Figma, Notion | Server tampil untuk semua user, tapi **tiap user login ke akunnya sendiri**. |
+
+```bash
+curl -X POST http://localhost:4000/api/mcp/servers -H "Authorization: Bearer <access_token admin>" \n  -H "Content-Type: application/json" \n  -d '{"name":"github","url":"https://<server-mcp>/mcp","keywords":["github","repo"],"shared_login":true}'
+```
+
+Aturan:
+- Hanya admin yang bisa menghapus server ini. Saat dihapus, server hilang untuk semua user beserta login semua user ke server itu.
+- Nama server global tidak boleh sama dengan server bawaan atau server pribadi user mana pun. User juga tidak bisa membuat server pribadi dengan nama server global.
+- Bila nama sama, urutan prioritasnya: `mcp.json`, lalu server admin, lalu server pribadi user.
+- User dari aplikasi pihak ketiga selalu role user, jadi server yang mereka tambahkan selalu pribadi. `shared_login` dari user biasa diabaikan.
+- **Hati-hati dengan login bersama:** semua user bertindak atas nama akun admin di layanan itu, termasuk menulis atau menghapus bila tool-nya mengizinkan. Pakai akun atau token dengan izin seperlunya.
+- `GET /api/mcp/servers` menampilkan field `global` dan `shared_login` untuk setiap server.
+
+## Server dari repo GitHub
+
+Server MCP yang belum punya alamat online bisa dipasang dari repo GitHub lewat chat, lalu dijalankan di container Docker terpisah. Lihat [Pasang MCP dari GitHub](13-pasang-mcp-dari-github.md).
 
 ## Server bawaan: `mcp.json`
 
@@ -90,13 +116,13 @@ Bila pesan mengandung kata seperti konek, connect, sambung, hubung, login, integ
 |---|---|---|
 | `list_connections` | "mcp apa aja yang udah tersambung?" | Status server bawaan + server milik user (connected, needs_login, disabled, error) |
 | `connect_service` | "tolong konekan saya ke canva" | Link login khusus user itu (berlaku 24 jam), atau info "sudah tersambung" |
-| `add_mcp_server` | "tambahkan MCP notion, url-nya https://mcp.notion.com/mcp" | URL dicek dulu (harus `https` dan benar-benar server MCP), lalu disimpan sebagai **server milik user itu** dan langsung aktif. Bila butuh login, chat memberi link login. |
-| `remove_mcp_server` | "hapus MCP notion" | Model meminta konfirmasi dulu, lalu server milik user dihapus beserta login-nya. Server bawaan tidak bisa dihapus lewat chat. |
+| `add_mcp_server` | "tambahkan MCP notion, url-nya https://mcp.notion.com/mcp" | URL dicek dulu (harus `https` dan benar-benar server MCP), lalu disimpan dan langsung aktif: **untuk semua user** bila yang meminta admin (dengan pilihan login bersama), atau hanya untuk user itu bila user biasa. Bila butuh login, chat memberi link login. |
+| `remove_mcp_server` | "hapus MCP notion" | Model meminta konfirmasi dulu, lalu server milik user dihapus beserta login-nya. Server bawaan tidak bisa dihapus lewat chat, dan server dari admin hanya bisa dihapus admin. |
 
 Catatan:
 - URL yang bukan server MCP ditolak.
 - Server yang memakai **API key** ditambahkan admin di `mcp.json` (`headers`), karena chat tidak boleh menerima token atau password.
-- Saat ini semua user chat boleh menambah server miliknya sendiri. Nanti diamankan lewat API key chat di aplikasi.
+- Semua user boleh menambah server pribadinya sendiri. Hanya admin yang bisa menambah server untuk semua user.
 - Hal yang sama tersedia lewat API: `POST /api/mcp/servers` dan `DELETE /api/mcp/servers/:name` (dengan header `X-User-Id`).
 
 ## Memilih tool yang dikirim ke model

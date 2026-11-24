@@ -73,14 +73,27 @@ type Options struct {
 
 // serverDef adalah satu server yang terlihat oleh seorang user.
 type serverDef struct {
-	Name string
-	Cfg  ServerConfig
-	Own  bool // true = milik user (m_mcp_servers), false = bawaan mcp.json
+	Name   string
+	Cfg    ServerConfig
+	Own    bool   // true = server pribadi user ini (m_mcp_servers)
+	Global bool   // true = dibuat admin, berlaku untuk semua user
+	Shared bool   // true = semua user memakai login Owner (admin pembuatnya)
+	Owner  string // admin pembuat server global
+}
+
+// credUser adalah user yang login-nya dipakai untuk server ini: admin
+// pembuatnya bila login dipakai bersama, selain itu user itu sendiri.
+func (d serverDef) credUser(user string) string {
+	if d.Shared && d.Owner != "" {
+		return d.Owner
+	}
+	return user
 }
 
 // conn adalah koneksi satu user ke satu server beserta statusnya.
 type conn struct {
-	user, name string
+	user, name string // user = pemilik login (admin bila login dipakai bersama)
+	shared     bool
 	cfg        ServerConfig
 	client     *clients.MCPClient
 	tokens     *tokenHandler
@@ -122,9 +135,10 @@ type Service struct {
 
 	global []serverDef // dari mcp.json, terurut menurut nama
 
-	mu       sync.Mutex
-	conns    map[string]*conn // kunci: user \x00 server
-	userDefs map[string]userDefsEntry
+	mu        sync.Mutex
+	conns     map[string]*conn // kunci: pemilik login \x00 server
+	userDefs  map[string]userDefsEntry
+	adminDefs userDefsEntry // server global buatan admin (cache)
 }
 
 // NewService membuat Service dari isi mcp.json (server bawaan). box boleh nil
@@ -189,14 +203,57 @@ func (s *Service) defs(ctx context.Context, user string) []serverDef {
 		}
 	}
 
+	// urutan prioritas bila nama sama: mcp.json, buatan admin, milik user
 	out := make([]serverDef, 0, len(s.global)+len(own))
-	out = append(out, s.global...)
-	return append(out, own...)
+	seen := map[string]bool{}
+	for _, group := range [][]serverDef{s.global, s.adminServers(ctx), own} {
+		for _, d := range group {
+			if !seen[d.Name] {
+				seen[d.Name] = true
+				out = append(out, d)
+			}
+		}
+	}
+	return out
+}
+
+// adminServers mengambil server global buatan admin (cache userDefsTTL).
+func (s *Service) adminServers(ctx context.Context) []serverDef {
+	s.mu.Lock()
+	e := s.adminDefs
+	s.mu.Unlock()
+	if !e.at.IsZero() && time.Since(e.at) <= userDefsTTL {
+		return e.defs
+	}
+	rows, err := s.repo.ListGlobalServers(ctx)
+	if err != nil {
+		logger.Warn("baca server mcp global gagal", zap.Error(err))
+		return e.defs
+	}
+	defs := make([]serverDef, 0, len(rows))
+	for _, r := range rows {
+		var kw []string
+		_ = json.Unmarshal([]byte(r.Keywords), &kw)
+		defs = append(defs, serverDef{Name: r.Name, Cfg: ServerConfig{URL: r.URL, Keywords: kw},
+			Global: true, Shared: r.SharedLogin, Owner: r.UserID})
+	}
+	s.mu.Lock()
+	s.adminDefs = userDefsEntry{defs: defs, at: time.Now()}
+	s.mu.Unlock()
+	return defs
 }
 
 func (s *Service) invalidateDefs(user string) {
 	s.mu.Lock()
 	delete(s.userDefs, user)
+	s.mu.Unlock()
+}
+
+// invalidateAll membuang cache daftar server semua user (server global berubah).
+func (s *Service) invalidateAll() {
+	s.mu.Lock()
+	s.userDefs = map[string]userDefsEntry{}
+	s.adminDefs = userDefsEntry{}
 	s.mu.Unlock()
 }
 
@@ -209,8 +266,10 @@ func (s *Service) findDef(ctx context.Context, user, name string) (serverDef, bo
 	return serverDef{}, false
 }
 
-// connFor mengambil (atau membuat) koneksi user ke server def.
+// connFor mengambil (atau membuat) koneksi user ke server def. Server dengan
+// login bersama memakai SATU koneksi (milik admin) untuk semua user.
 func (s *Service) connFor(user string, d serverDef) *conn {
+	user = d.credUser(user)
 	key := connKey(user, d.Name)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -222,21 +281,22 @@ func (s *Service) connFor(user string, d serverDef) *conn {
 	} else if c != nil {
 		c.client.Close() // URL server berubah
 	}
-	c := &conn{user: user, name: d.Name, cfg: d.Cfg, state: StateConnecting, lastUsed: time.Now()}
+	c := &conn{user: user, name: d.Name, shared: d.Shared, cfg: d.Cfg, state: StateConnecting, lastUsed: time.Now()}
 	c.tokens = &tokenHandler{svc: s, user: user, server: d.Name}
 	c.client = clients.NewMCPClient(d.Name, d.Cfg.URL, expandHeaders(d.Cfg.Headers), c.tokens)
 	s.conns[key] = c
 	return c
 }
 
-// existing mengambil koneksi user yang sudah ada (tanpa membuat baru).
-func (s *Service) existing(user string) []*conn {
+// existing mengambil koneksi user yang sudah ada (tanpa membuat baru),
+// termasuk koneksi bersama milik admin untuk server global.
+func (s *Service) existing(ctx context.Context, user string) []*conn {
+	defs := s.defs(ctx, user)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []*conn
-	prefix := user + "\x00"
-	for k, c := range s.conns {
-		if strings.HasPrefix(k, prefix) {
+	for _, d := range defs {
+		if c := s.conns[connKey(d.credUser(user), d.Name)]; c != nil {
 			out = append(out, c)
 		}
 	}
@@ -387,14 +447,14 @@ func (s *Service) Select(ctx context.Context, query string) []llmtool.Spec {
 // Has melaporkan apakah tool ini milik salah satu server MCP user di ctx.
 func (s *Service) Has(ctx context.Context, name string) bool {
 	user := userctx.From(ctx)
-	return user != "" && buildIndex(s.existing(user)).byName[name] != nil
+	return user != "" && buildIndex(s.existing(ctx, user)).byName[name] != nil
 }
 
 // Call menjalankan tool yang diminta model dengan akun user di ctx. Hasilnya
 // selalu teks untuk model; kegagalan juga dilaporkan sebagai teks (IsError)
 // supaya model bisa memperbaiki argumen atau menjelaskan ke user.
 func (s *Service) Call(ctx context.Context, name, args string) llmtool.Result {
-	e := buildIndex(s.existing(userctx.From(ctx))).byName[name]
+	e := buildIndex(s.existing(ctx, userctx.From(ctx))).byName[name]
 	if e == nil {
 		return llmtool.Result{Text: "tool " + name + " tidak dikenal atau servernya sedang tidak terhubung", IsError: true}
 	}
@@ -409,6 +469,11 @@ func (s *Service) Call(ctx context.Context, name, args string) llmtool.Result {
 			e.conn.mu.Lock()
 			e.conn.state = StateNeedsLogin
 			e.conn.mu.Unlock()
+			if e.conn.shared {
+				// login bersama milik admin: user lain tidak boleh diberi link login admin
+				return llmtool.Result{Text: "akses ke " + e.conn.name + " ditolak: login bersama milik admin perlu diperbarui. " +
+					"Minta user menghubungi admin.", IsError: true}
+			}
 			return llmtool.Result{Text: "akses ke " + e.conn.name + " ditolak: user perlu login ulang. Link login: " +
 				s.connectURL(e.conn.user, e.conn.name), IsError: true}
 		}
@@ -444,7 +509,8 @@ func (s *Service) Statuses(ctx context.Context, user string) []ServerStatus {
 	defs := s.defs(ctx, user)
 	out := make([]ServerStatus, 0, len(defs))
 	for _, d := range defs {
-		st := ServerStatus{Name: d.Name, URL: d.Cfg.URL, Own: d.Own, State: StateDisabled}
+		st := ServerStatus{Name: d.Name, URL: d.Cfg.URL, Own: d.Own, Global: d.Global, SharedLogin: d.Shared, State: StateDisabled}
+		loginOwner := d.credUser(user)
 		if c := conns[d.Name]; c != nil {
 			c.mu.Lock()
 			st.State, st.Error, st.Tools, st.RefreshedAt = c.state, c.err, len(c.tools), c.refreshedAt
@@ -454,9 +520,12 @@ func (s *Service) Statuses(ctx context.Context, user string) []ServerStatus {
 				}
 			}
 			c.mu.Unlock()
-			st.ConnectURL = s.connectURL(user, d.Name)
+			// login bersama hanya boleh diurus admin pembuatnya
+			if loginOwner == user {
+				st.ConnectURL = s.connectURL(user, d.Name)
+			}
 		}
-		if cred, err := s.repo.GetCredential(ctx, user, d.Name); err == nil && cred != nil && cred.AccessTokenEnc != "" {
+		if cred, err := s.repo.GetCredential(ctx, loginOwner, d.Name); err == nil && cred != nil && cred.AccessTokenEnc != "" {
 			st.LoggedIn, st.TokenExpires = true, cred.ExpiresAt
 		}
 		out = append(out, st)
@@ -541,6 +610,9 @@ func (s *Service) StartLogin(ctx context.Context, user, name string) (string, er
 	d, err := s.enabledDef(ctx, user, name)
 	if err != nil {
 		return "", err
+	}
+	if d.credUser(user) != user {
+		return "", apperror.NewForbidden("Server " + name + " memakai login bersama yang diatur admin; hubungi admin")
 	}
 	if s.box == nil {
 		return "", apperror.NewInternalServerError("MCP_TOKEN_KEY belum diisi")
@@ -644,6 +716,9 @@ func (s *Service) Logout(ctx context.Context, user, name string) (*ServerStatus,
 	if err != nil {
 		return nil, err
 	}
+	if d.credUser(user) != user {
+		return nil, apperror.NewForbidden("Server " + name + " memakai login bersama yang diatur admin; hubungi admin")
+	}
 	if err := s.repo.ClearTokens(ctx, user, name); err != nil {
 		return nil, err
 	}
@@ -656,16 +731,27 @@ func (s *Service) Logout(ctx context.Context, user, name string) (*ServerStatus,
 	return s.status(ctx, user, name), nil
 }
 
-// AddServer menambah server MCP milik user: URL dicek dulu (harus https dan
-// benar server MCP), lalu disimpan di m_mcp_servers dan langsung aktif.
-// Mengembalikan status dan catatan tambahan (mis. server butuh API key).
-func (s *Service) AddServer(ctx context.Context, user, name, rawURL string, keywords []string) (*ServerStatus, string, error) {
+// AddServer menambah server MCP: URL dicek dulu (harus https dan benar server
+// MCP), lalu disimpan di m_mcp_servers dan langsung aktif. Buatan admin
+// berlaku untuk SEMUA user (sharedLogin: semua memakai login admin); buatan
+// user biasa hanya untuk dirinya (sharedLogin diabaikan). Mengembalikan
+// status dan catatan tambahan (mis. server butuh API key).
+func (s *Service) AddServer(ctx context.Context, user, name, rawURL string, keywords []string, sharedLogin bool) (*ServerStatus, string, error) {
+	admin := userctx.IsAdmin(ctx)
 	name = strings.ToLower(strings.TrimSpace(name))
 	if !serverNameRe.MatchString(name) {
 		return nil, "", errors.New("nama server harus huruf kecil/angka/-/_ (maks 40), mis. notion")
 	}
 	if _, exists := s.findDef(ctx, user, name); exists {
 		return nil, "", fmt.Errorf("server %q sudah ada; hapus dulu bila ingin mengganti URL-nya", name)
+	}
+	if admin {
+		// server global tidak boleh bentrok dengan server pribadi user mana pun
+		if taken, err := s.repo.NameTaken(ctx, name); err != nil {
+			return nil, "", err
+		} else if taken {
+			return nil, "", fmt.Errorf("nama server %q sudah dipakai user lain; pilih nama lain", name)
+		}
 	}
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || u.Host == "" {
@@ -699,11 +785,17 @@ func (s *Service) AddServer(ctx context.Context, user, name, rawURL string, keyw
 		keywords = []string{name}
 	}
 	kw, _ := json.Marshal(keywords)
-	if err := s.repo.CreateUserServer(ctx, &UserServer{UserID: user, Name: name, URL: u.String(), Keywords: string(kw)}); err != nil {
+	row := &UserServer{UserID: user, Name: name, URL: u.String(), Keywords: string(kw), Global: admin, SharedLogin: admin && sharedLogin}
+	if err := s.repo.CreateUserServer(ctx, row); err != nil {
 		return nil, "", fmt.Errorf("gagal menyimpan server: %w", err)
 	}
-	s.invalidateDefs(user)
-	logger.Info("server mcp milik user ditambahkan", zap.String("user", user), zap.String("server", name), zap.String("url", u.String()))
+	if admin {
+		s.invalidateAll()
+	} else {
+		s.invalidateDefs(user)
+	}
+	logger.Info("server mcp ditambahkan", zap.String("user", user), zap.String("server", name), zap.String("url", u.String()),
+		zap.Bool("global", row.Global), zap.Bool("shared_login", row.SharedLogin))
 
 	d, _ := s.findDef(ctx, user, name)
 	s.refresh(ctx, s.connFor(user, d), listTimeout)
@@ -718,6 +810,12 @@ func (s *Service) RemoveServer(ctx context.Context, user, name string) error {
 		if g.Name == name {
 			return fmt.Errorf("server %q adalah server bawaan (mcp.json) dan hanya bisa diubah admin; user cukup logout bila tidak ingin memakainya", name)
 		}
+	}
+	if installed, err := s.repo.IsInstalled(ctx, name); err == nil && installed {
+		return fmt.Errorf("server %q dipasang dari GitHub; hentikan/hapus lewat manage_mcp_install (atau /api/mcp/installs)", name)
+	}
+	if d, ok := s.findDef(ctx, user, name); ok && d.Global {
+		return s.removeGlobal(ctx, name)
 	}
 	n, err := s.repo.DeleteUserServer(ctx, user, name)
 	if err != nil {
@@ -738,6 +836,85 @@ func (s *Service) RemoveServer(ctx context.Context, user, name string) error {
 		logger.Warn("hapus kredensial server mcp gagal", zap.String("server", name), zap.Error(err))
 	}
 	logger.Info("server mcp milik user dihapus", zap.String("user", user), zap.String("server", name))
+	return nil
+}
+
+// NameAvailable melaporkan apakah nama server belum dipakai (mcp.json maupun
+// m_mcp_servers milik siapa pun). Dipakai sebelum memasang MCP dari GitHub.
+func (s *Service) NameAvailable(ctx context.Context, name string) (bool, error) {
+	for _, g := range s.global {
+		if g.Name == name {
+			return false, nil
+		}
+	}
+	taken, err := s.repo.NameTaken(ctx, name)
+	return !taken, err
+}
+
+// RegisterInstalled mendaftarkan server MCP hasil install GitHub yang sudah
+// berjalan di container. global = dipasang admin, berlaku untuk semua user
+// (login bersama, karena data rahasianya milik admin); selain itu hanya untuk
+// owner yang memintanya.
+func (s *Service) RegisterInstalled(ctx context.Context, owner, name, endpoint string, keywords []string, global bool) error {
+	if len(keywords) == 0 {
+		keywords = []string{name}
+	}
+	kw, _ := json.Marshal(keywords)
+	row := &UserServer{UserID: owner, Name: name, URL: endpoint, Keywords: string(kw),
+		Global: global, SharedLogin: global, Installed: true}
+	if err := s.repo.ReplaceServer(ctx, row); err != nil {
+		return err
+	}
+	s.invalidateAll()
+	logger.Info("server mcp hasil install didaftarkan", zap.String("server", name), zap.String("url", endpoint), zap.Bool("global", global))
+	return nil
+}
+
+// UnregisterInstalled melepas server MCP hasil install (container dihentikan
+// oleh pemanggil): pendaftaran, koneksi, dan login semua user ke server itu.
+func (s *Service) UnregisterInstalled(ctx context.Context, owner, name string) error {
+	if err := s.repo.DeleteServer(ctx, owner, name); err != nil {
+		return err
+	}
+	s.invalidateAll()
+	s.mu.Lock()
+	suffix := "\x00" + name
+	for k, c := range s.conns {
+		if strings.HasSuffix(k, suffix) {
+			c.client.Close()
+			delete(s.conns, k)
+		}
+	}
+	s.mu.Unlock()
+	if err := s.repo.DeleteCredentialsByServer(ctx, name); err != nil {
+		logger.Warn("hapus kredensial server mcp hasil install gagal", zap.String("server", name), zap.Error(err))
+	}
+	return nil
+}
+
+// removeGlobal menghapus server buatan admin untuk semua user, beserta login
+// semua user ke server itu. Hanya admin.
+func (s *Service) removeGlobal(ctx context.Context, name string) error {
+	if !userctx.IsAdmin(ctx) {
+		return fmt.Errorf("server %q dibuat admin untuk semua user dan hanya bisa dihapus admin", name)
+	}
+	if _, err := s.repo.DeleteGlobalServer(ctx, name); err != nil {
+		return err
+	}
+	s.invalidateAll()
+	s.mu.Lock()
+	suffix := "\x00" + name
+	for k, c := range s.conns {
+		if strings.HasSuffix(k, suffix) {
+			c.client.Close()
+			delete(s.conns, k)
+		}
+	}
+	s.mu.Unlock()
+	if err := s.repo.DeleteCredentialsByServer(ctx, name); err != nil {
+		logger.Warn("hapus kredensial server mcp global gagal", zap.String("server", name), zap.Error(err))
+	}
+	logger.Info("server mcp global dihapus", zap.String("server", name))
 	return nil
 }
 
@@ -1076,15 +1253,19 @@ func NewConnectTool(svc *Service) *ConnectTool {
 				"name": map[string]any{"type": "string", "description": "nama server MCP, mis. canva"},
 			}, "required": []string{"name"}})},
 		{Name: toolAddServer, Source: "connect", Definition: llmtool.Function(toolAddServer,
-			"Tambah server MCP baru milik user ini dari URL yang ia berikan (langsung aktif, hanya untuk user ini). "+
+			"Tambah server MCP baru dari URL yang diberikan user (langsung aktif). Bila yang meminta user biasa, server hanya "+
+				"untuk dirinya. Bila yang meminta admin, server berlaku untuk SEMUA user. "+
 				"Pakai hanya bila user memberi URL server MCP. Setelah berhasil, tawarkan link login bila servernya butuh login.",
 			map[string]any{"type": "object", "properties": map[string]any{
 				"name":     map[string]any{"type": "string", "description": "nama pendek server, huruf kecil, mis. notion"},
 				"url":      map[string]any{"type": "string", "description": "URL endpoint MCP (https), mis. https://mcp.notion.com/mcp"},
 				"keywords": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "kata kunci bahasa user untuk memilih tool server ini, mis. [\"notion\",\"catatan\"]"},
+				"shared_login": map[string]any{"type": "boolean", "description": "hanya untuk admin: true = semua user memakai login admin " +
+					"(mis. GitHub/database organisasi); false = tiap user login ke akunnya sendiri (mis. Canva pribadi). Tanyakan ke admin bila belum jelas."},
 			}, "required": []string{"name", "url"}})},
 		{Name: toolRemoveServer, Source: "connect", Definition: llmtool.Function(toolRemoveServer,
-			"Hapus server MCP milik user ini beserta login-nya. Konfirmasi dulu ke user sebelum memanggil.",
+			"Hapus server MCP milik user ini beserta login-nya (admin juga bisa menghapus server yang berlaku untuk semua user). "+
+				"Konfirmasi dulu ke user sebelum memanggil.",
 			map[string]any{"type": "object", "properties": map[string]any{
 				"name": map[string]any{"type": "string", "description": "nama server yang dihapus"},
 			}, "required": []string{"name"}})},
@@ -1123,18 +1304,22 @@ func (t *ConnectTool) Call(ctx context.Context, name, args string) llmtool.Resul
 	switch name {
 	case toolAddServer:
 		var a struct {
-			Name     string   `json:"name"`
-			URL      string   `json:"url"`
-			Keywords []string `json:"keywords"`
+			Name        string   `json:"name"`
+			URL         string   `json:"url"`
+			Keywords    []string `json:"keywords"`
+			SharedLogin bool     `json:"shared_login"`
 		}
 		if err := json.Unmarshal([]byte(args), &a); err != nil {
 			return llmtool.Result{Text: `argumen tidak valid: kirim {"name": "...", "url": "https://..."}`, IsError: true}
 		}
-		st, note, err := t.svc.AddServer(ctx, user, a.Name, a.URL, a.Keywords)
+		st, note, err := t.svc.AddServer(ctx, user, a.Name, a.URL, a.Keywords, a.SharedLogin)
 		if err != nil {
 			return llmtool.Result{Text: "gagal menambah server MCP: " + err.Error(), IsError: true}
 		}
 		text := "Server ditambahkan ke daftar milik user ini dan langsung aktif: " + describeServer(*st)
+		if st.Global {
+			text = "Server ditambahkan untuk SEMUA user dan langsung aktif: " + describeServer(*st)
+		}
 		if st.State != StateConnected {
 			text += "\nLink login: " + st.ConnectURL + "\nMinta user membuka link itu, login, lalu kembali ke chat."
 		}
@@ -1150,7 +1335,7 @@ func (t *ConnectTool) Call(ctx context.Context, name, args string) llmtool.Resul
 		if err := t.svc.RemoveServer(ctx, user, a.Name); err != nil {
 			return llmtool.Result{Text: "gagal menghapus server MCP: " + err.Error(), IsError: true}
 		}
-		return llmtool.Result{Text: "Server " + a.Name + " dihapus dari daftar milik user ini beserta login-nya."}
+		return llmtool.Result{Text: "Server " + a.Name + " dihapus beserta login-nya."}
 	}
 
 	servers := t.svc.Statuses(ctx, user)
@@ -1176,6 +1361,10 @@ func (t *ConnectTool) Call(ctx context.Context, name, args string) llmtool.Resul
 		if strings.ToLower(st.Name) != want {
 			continue
 		}
+		if st.SharedLogin && st.ConnectURL == "" && st.State != StateConnected {
+			return llmtool.Result{Text: describeServer(st) + ". Server ini memakai login bersama yang diatur admin; " +
+				"user tidak perlu (dan tidak bisa) login sendiri. Minta user menghubungi admin."}
+		}
 		switch st.State {
 		case StateConnected:
 			return llmtool.Result{Text: describeServer(st) + ". Sudah tersambung ke akun user ini, tidak perlu login lagi."}
@@ -1199,7 +1388,12 @@ func (t *ConnectTool) Call(ctx context.Context, name, args string) llmtool.Resul
 
 func describeServer(st ServerStatus) string {
 	s := fmt.Sprintf("%s: %s", st.Name, st.State)
-	if st.Own {
+	switch {
+	case st.Global && st.SharedLogin:
+		s += " (dari admin, untuk semua user, login bersama admin)"
+	case st.Global:
+		s += " (dari admin, untuk semua user, login masing-masing)"
+	case st.Own:
 		s += " (ditambahkan user)"
 	}
 	if st.Tools > 0 {

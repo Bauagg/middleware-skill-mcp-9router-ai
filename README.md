@@ -1,21 +1,26 @@
 # middleware-skill-ai
 
-Kerangka backend **Go + Gin + GORM (PostgreSQL)** untuk proyek *Skill Middleware 9Router*.
-Konvensi arsitektur mengikuti template Express+TypeScript
-[`Bauagg/template-express-ts-backend`](https://github.com/Bauagg/template-express-ts-backend),
-diportalkan ke gaya idiomatik Go.
+Middleware **Go + Gin + GORM (PostgreSQL) + Redis** yang berdiri di depan **9Router milik user**. Setiap chat dibekali skill, context pack, dan catatan memori, lalu bisa memakai tool: MCP (Canva, Figma, dan server lain), MCP yang dipasang dari GitHub (berjalan di container Docker terpisah), pembuat gambar, pencarian web, buat skill, dan impor skill dari GitHub. Konvensi arsitektur mengikuti template [`Bauagg/template-express-ts-backend`](https://github.com/Bauagg/template-express-ts-backend) yang diportalkan ke gaya idiomatik Go.
 
-> Ini **kerangka inti** (config, logger, koneksi DB, middleware global, amplop
-> respons, error handling terpusat). Domain contoh CRUD/auth (users, companies,
-> JWT, bcrypt) **sudah dihapus** karena tidak dibutuhkan middleware. Logika inti
-> middleware — proxy `/v1/chat/completions` ke 9Router, pemilihan skill (BM25),
-> dan injeksi system prompt — dibangun di atas kerangka ini pada tahap berikutnya.
+> **Dokumentasi lengkap** (cara kerja, struktur kode, skill, memori, API, konfigurasi, deploy, MCP, gambar, akun, pasang MCP dari GitHub, dan solusi error umum) ada di folder [`docs/`](docs/README.md).
 
-> **Dokumentasi lengkap** (cara kerja, struktur kode, skill, memori, API, konfigurasi, deploy, dan solusi error umum) ada di folder [`docs/`](docs/README.md).
+## Akses dan Identitas (ringkas)
 
-> **Secret key:** setiap request wajib membawa header **`X-API-Key`** (nilai dari `API_KEYS` di `.env`), kecuali `/health`, `/images/...`, dan alur login MCP yang dibuka browser. User tanpa aplikasi pihak ketiga bisa register/login di `/api/auth/*` dan memakai `Authorization: Bearer <access_token>` sebagai pengganti `X-API-Key` + `X-User-Id`; admin (dari `ADMIN_EMAIL`) melihat data semua user, user biasa hanya miliknya, skill tetap global ([docs/12](docs/12-akun-dan-login.md)). Request `/v1/*` juga wajib membawa **`X-Router-URL`** (alamat 9Router milik user) dan **`X-Router-Key`** (key 9Router milik user), dan chat wajib mengirim `model`.
->
-> **Identitas user:** semua request chat dan API data wajib membawa header **`X-User-Id`** dari aplikasi client. Log, eval, context pack, catatan memori, gambar, dan koneksi MCP disimpan per user. Skill berlaku untuk semua user. Lihat [`docs/07-api.md`](docs/07-api.md).
+Ada **dua cara masuk**, keduanya bisa dipakai bersamaan:
+
+| Cara | Untuk | Header | `user_id` | Role |
+|---|---|---|---|---|
+| Aplikasi pihak ketiga | aplikasi yang sudah punya user sendiri (mis. Luma) | `X-API-Key` (dari `API_KEYS`) + `X-User-Id` | isi `X-User-Id` | selalu `user` |
+| Akun middleware | user yang register/login di middleware (web middleware AI) | `Authorization: Bearer <access_token>` | `id` di `m_users` (header `X-User-Id` diabaikan) | `user` atau `admin` |
+
+Chat (`/v1/*`) juga wajib membawa **9Router milik user**: `X-Router-URL` (alamat, 400 bila tidak ada), `X-Router-Key` (key, 401 bila tidak ada), dan field `model` (400 bila tidak ada). Middleware **tidak punya** alamat, key, atau model 9Router sendiri di `.env`.
+
+- **Admin** = pemilik aplikasi (dibuat dari `ADMIN_EMAIL`/`ADMIN_PASSWORD`). Admin melihat data **semua** user di `/api/*`, dan server MCP yang dibuat admin berlaku untuk semua user.
+- **User biasa**, termasuk semua user dari pihak ketiga, hanya melihat datanya sendiri.
+- **Skill selalu global** untuk semua user.
+- Endpoint terbuka tanpa key/token: `/`, `/health`, `/images/...`, `POST /api/auth/register|login|refresh`, alur login MCP, dan form data rahasia MCP (keduanya lewat link bertanda tangan).
+
+Detail: [`docs/07-api.md`](docs/07-api.md) dan [`docs/12-akun-dan-login.md`](docs/12-akun-dan-login.md).
 
 ## Tech Stack
 
@@ -28,56 +33,67 @@ diportalkan ke gaya idiomatik Go.
 | Validasi request | **go-playground/validator** (bawaan Gin) |
 | Config | **godotenv** |
 | Cache | **Redis** (`redis/go-redis`) |
+| Token login | **golang-jwt/jwt v5** (HS256) + **bcrypt** (`golang.org/x/crypto`) |
+| Klien MCP | **modelcontextprotocol/go-sdk** (Streamable HTTP) + OAuth (`golang.org/x/oauth2`) |
+| Container MCP dari GitHub | Docker Engine API (tanpa SDK) lewat **docker-socket-proxy**, runner berisi **supergateway** |
+| Pencarian web | **SearXNG** (self-host, service di docker-compose) |
 
 ## Struktur Folder
 
 ```
 middleware-skill-ai/
-├── cmd/server/main.go            # Entry point (config -> logger -> DB -> middleware -> router -> run)
+├── cmd/server/main.go            # Entry point (config -> logger -> DB -> token -> middleware -> router -> run)
 ├── internal/
 │   ├── config/config.go          # Muat .env -> struct Config
 │   ├── logger/logger.go          # zap: logs/combined.log + logs/error.log + console
-│   ├── database/database.go      # Koneksi GORM + AutoMigrate (siap dipakai)
-│   ├── middleware/               # cors, http-logger (morgan-like), recovery (panic->500)
-│   ├── router/router.go          # Agregasi route (titik daftar endpoint middleware)
-│   ├── services/                 # satu folder per domain (controller, service, dto, route, ...)
-│   │   ├── skillstore/           # upload, daftar, dan Render skill (bersihkan, budget, SHORT.md); preview
+│   ├── database/database.go      # Koneksi GORM, AutoMigrate, ByUser (filter per user; "" = admin lihat semua)
+│   ├── middleware/               # auth (token login / X-API-Key), cors, http-logger, recovery (panic->500)
+│   ├── router/router.go          # Wiring terpusat semua service dan route
+│   ├── services/                 # satu folder per domain (controller, service, repository, route, dto, model)
+│   │   ├── auth/                 # register, login, refresh token, akun admin dari .env (m_users)
+│   │   ├── skillstore/           # upload, daftar, export, Render skill; tool create_skill & import_skills_from_github
 │   │   ├── skillindex/           # index skill di memori, pemilih skill (BM25), skill aktif percakapan, watcher
 │   │   ├── skillcache/           # cache Redis: skill aktif per percakapan + hasil seleksi
-│   │   ├── proxy/                # proxy /v1/* + penyisipan skill, context pack, catatan, dan putaran tool MCP di chat/completions
-│   │   ├── skillfallback/        # pemilih cadangan: model 9Router memilih skill saat skor ambigu
+│   │   ├── skillfallback/        # pemilih cadangan: model chat user memilih skill saat skor ambigu
+│   │   ├── proxy/                # proxy /v1/* + penyisipan skill/context pack/catatan + putaran tool
 │   │   ├── eval/                 # eval skill: EVAL.yaml -> jawaban model -> skor hakim -> t_eval_runs
-│   │   ├── contextpack/          # context pack (m_context_packs): ringkasan tetap yang selalu disisipkan
-│   │   ├── memorynote/           # catatan memori (t_memory_notes): ekstraksi, konfirmasi, pencarian teks
-│   │   ├── imagegen/             # tool generate_image: buat gambar lewat chat, simpan di images/ + t_generated_images
-│   │   ├── mcp/                  # koneksi MCP (Canva, ...): mcp.json, login OAuth (m_mcp_credentials), pilih & jalankan tool
-│   │   └── usagelog/             # log pemakaian di PostgreSQL (t_usage_logs) + GET /api/usage-logs
+│   │   ├── contextpack/          # context pack per user (m_context_packs)
+│   │   ├── memorynote/           # catatan memori per user (t_memory_notes): ekstraksi, konfirmasi, pencarian
+│   │   ├── imagegen/             # tool generate_image: gambar lewat chat, simpan di images/ + t_generated_images
+│   │   ├── websearch/            # tool web_search lewat SearXNG + GET /api/web-search
+│   │   ├── mcp/                  # MCP: mcp.json, server admin (global) & pribadi, login OAuth per user, tool kelola lewat chat
+│   │   ├── mcpinstall/           # pasang MCP dari GitHub: analisis, persetujuan admin, form rahasia, container Docker
+│   │   └── usagelog/             # log pemakaian (t_usage_logs) + GET /api/usage-logs
 │   ├── clients/                  # klien layanan pihak ketiga, satu file per layanan
-│   │   ├── 9router.go            # koneksi ke 9Router (reverse proxy, timeout, format error, pengamatan token)
-│   │   ├── redis.go              # koneksi Redis (timeout pendek, gagal = cache miss)
-│   │   ├── embedding.go          # klien embedding umum (POST /embeddings: 9Router, Ollama, dll.)
-│   │   ├── mcp.go                # klien server MCP (Streamable HTTP, SDK resmi go-sdk): daftar & panggil tool
+│   │   ├── 9router.go            # proxy ke 9Router milik user (alamat & key dari context), pengamatan token
+│   │   ├── routerurl.go          # validasi X-Router-URL + transport yang menolak alamat jaringan internal
+│   │   ├── images.go             # buat gambar (POST /images/generations) + daftar model gambar akun user
+│   │   ├── embedding.go          # klien embedding umum (POST /embeddings)
+│   │   ├── mcp.go                # klien server MCP (Streamable HTTP, go-sdk): daftar & panggil tool
 │   │   ├── mcpauth.go            # discovery OAuth server MCP + pendaftaran klien otomatis (DCR)
-│   │   └── images.go             # klien pembuat gambar berformat OpenAI (POST /images/generations)
+│   │   ├── github.go             # unduh zip repo GitHub + SHA commit
+│   │   ├── docker.go             # Docker Engine API: buat/jalankan/hentikan/hapus container MCP
+│   │   ├── websearch.go          # klien SearXNG
+│   │   └── redis.go              # koneksi Redis (timeout pendek, gagal = cache miss)
 │   └── pkg/                      # pustaka bersama, tidak tahu soal domain
-│       ├── response/             # Amplop {status,message,data,errors}
-│       ├── apperror/             # AppError + Handle + BindingErrors
-│       ├── frontmatter/          # parser frontmatter SKILL.md (name, description, keywords)
-│       ├── bm25/                 # tokenizer (Indonesia + Inggris) dan skor BM25
-│       ├── openai/               # membaca field usage dari respons ala OpenAI (JSON dan SSE)
-│       ├── tokens/               # perkiraan jumlah token (karakter / 4) dan pemotongan teks
-│       ├── skillclean/           # pembersih isi SKILL.md dari bagian khusus Claude (aturan mudah ditambah)
-│       ├── modelbudget/          # budget token per model (pola nama model -> token)
-│       ├── uuidparam/            # validasi parameter path :id berformat UUID (400 bila bukan)
-│       ├── vector/               # kemiripan kosinus untuk seleksi embedding
-│       ├── secretbox/            # enkripsi AES-256-GCM untuk token login MCP di database
-│       └── llmtool/              # bentuk tool untuk model + hasilnya (dipakai MCP, pembuat gambar, proxy)
-├── docker/redis-dev/             # Redis DEV (docker compose) untuk dijalankan di VPS, port 6380
+│       ├── response/, apperror/  # amplop {status,message,data,errors}, AppError + Handle
+│       ├── jwtauth/              # access & refresh token (JWT HS256)
+│       ├── userctx/              # user_id, role, scope admin/user, key/URL/model 9Router di context
+│       ├── frontmatter/, bm25/   # parser SKILL.md, tokenizer + skor BM25
+│       ├── openai/, tokens/      # baca usage OpenAI (JSON/SSE), perkiraan token
+│       ├── skillclean/, modelbudget/  # pembersih isi skill, budget token per model
+│       ├── uuidparam/, vector/   # validasi :id UUID, kemiripan kosinus
+│       ├── secretbox/            # enkripsi AES-256-GCM (token login MCP, data rahasia MCP dari GitHub)
+│       └── llmtool/              # bentuk tool untuk model + hasilnya
+├── docker/mcp-runner/Dockerfile  # image runner MCP dari GitHub (git, Node 22, pnpm, Python, uv, supergateway)
+├── searxng/settings.yml          # konfigurasi SearXNG
 ├── docs/                         # dokumentasi lengkap (mulai dari docs/README.md)
 ├── Dockerfile                    # image middleware (build 2 tahap, user non-root, healthcheck)
-├── docker-compose.yml            # menjalankan middleware di VPS (lihat docs/09-menjalankan-dan-deploy.md)
-├── mcp.json                      # daftar server MCP (lihat docs/10-mcp.md)
-├── skills/                       # folder skill (dipakai middleware, tahap lanjutan)
+├── docker-compose.yml            # middleware + searxng + docker-proxy + mcp-runner (lihat docs/09)
+├── mcp.json                      # server MCP bawaan (lihat docs/10-mcp.md)
+├── skills/                       # folder skill (dibuat otomatis, tidak di-commit)
+├── images/                       # gambar hasil generate (dibuat otomatis, tidak di-commit)
+├── open_source_mcp/              # clone repo MCP dari GitHub untuk diperiksa (dibuat otomatis, tidak di-commit)
 ├── logs/                         # output log (dibuat otomatis)
 ├── .env.example
 └── go.mod
@@ -104,39 +120,47 @@ docker compose up -d --build
 ```
 
 Server default di `http://localhost:4000`. Saat start, koneksi PostgreSQL dan Redis wajib
-berhasil (bila tidak, server berhenti dengan pesan error), lalu tabel `t_usage_logs`
-dimigrasikan otomatis.
+berhasil (bila tidak, server berhenti dengan pesan error), lalu **semua tabel dibuat/diperbarui
+otomatis** (AutoMigrate): `t_usage_logs`, `t_eval_runs`, `m_context_packs`, `t_memory_notes`,
+`m_mcp_credentials`, `m_mcp_servers`, `t_generated_images`, `m_users`, `m_mcp_installs`, dan
+`m_mcp_install_instances`. Akun admin dibuat dari `ADMIN_EMAIL`/`ADMIN_PASSWORD` bila diisi.
 
-## Redis DEV (Docker)
+Variabel wajib di `.env`: `DB_*`, `REDIS_ADDR`, `API_KEYS` (secret aplikasi pihak ketiga, min. 32
+karakter), dan `JWT_SECRET` (min. 32 karakter). `MCP_TOKEN_KEY` dibutuhkan untuk login MCP dan
+pasang MCP dari GitHub. Daftar lengkap: [`docs/08-konfigurasi.md`](docs/08-konfigurasi.md).
 
-Redis utama di VPS (`host.docker.internal:6379`) hanya bisa dipakai dari container di VPS. Untuk pengembangan dari komputer lokal, jalankan Redis DEV terpisah dari folder `docker/redis-dev/`:
+### Docker Compose (VPS)
 
-```bash
-# 1. salin folder ke VPS (dari root proyek)
-scp -r docker/redis-dev root@149.129.215.19:/opt/redis-dev
+`docker compose up -d --build` menjalankan:
 
-# 2. di VPS
-cd /opt/redis-dev
-cp .env.example .env          # isi REDIS_DEV_PASSWORD (atau salin .env lokal yang sudah berisi password)
-docker compose up -d
-docker compose ps             # STATUS harus healthy
-```
+| Service | Fungsi |
+|---|---|
+| `middleware` | aplikasi ini (port `127.0.0.1:4000`, buka ke publik lewat NGINX) |
+| `searxng` | mesin pencari untuk tool `web_search` |
+| `docker-proxy` | proxy Docker API yang hanya membuka urusan container, untuk pasang MCP dari GitHub |
+| `mcp-runner` | hanya membangun image runner MCP, lalu selesai |
 
-Lalu di `.env` proyek: `REDIS_ADDR=149.129.215.19:6380`, `REDIS_PASSWORD` sama dengan `REDIS_DEV_PASSWORD`, dan `REDIS_TIMEOUT=2s` (Redis di VPS berjarak 0,3-0,7 detik dari komputer lokal; bawaan 200 ms akan selalu timeout).
+Network `middleware_mcp_net` untuk container MCP, `docker_api` (internal) untuk middleware dan proxy saja. Volume: `skills_data`, `logs_data`, `images_data`, `mcp_repos_data`. Detail: [`docs/09-menjalankan-dan-deploy.md`](docs/09-menjalankan-dan-deploy.md).
 
-Isi `docker/redis-dev/`:
-- `docker-compose.yml`: `redis:7.4-alpine`, port 6380, data permanen di volume `redis_dev_data`, restart otomatis, healthcheck. Password diambil dari `.env`, tidak ditulis di file yang di-commit.
-- `redis.conf`: batas memori 256 MB (key lama dibuang bila penuh), dan perintah berbahaya (`FLUSHALL`, `FLUSHDB`, `CONFIG`, `DEBUG`, `MODULE`, `REPLICAOF`) dimatikan karena port ini terbuka ke internet.
+## Redis DEV
 
-Bila port 6380 tidak bisa dijangkau setelah container jalan, buka port itu di firewall VPS / security group penyedia cloud (seperti port 5433 untuk PostgreSQL DEV).
+Redis utama di VPS (`host.docker.internal:6379`) hanya bisa dipakai dari container di VPS. Untuk pengembangan dari komputer lokal dipakai Redis DEV terpisah yang berjalan sebagai container `redis-dev` di VPS (dikelola langsung di VPS, folder-nya tidak lagi ada di repo ini).
+
+Di `.env` lokal: `REDIS_ADDR` = alamat Redis DEV di VPS, `REDIS_PASSWORD` = password dari env container `redis-dev`, dan `REDIS_TIMEOUT=2s` (Redis di VPS berjarak 0,3-0,7 detik dari komputer lokal; bawaan 200 ms akan selalu timeout). Bila port-nya tidak bisa dijangkau, buka port itu di firewall VPS / security group penyedia cloud.
 
 ## Endpoint (saat ini)
+
+Semua `/api/*` data per user butuh identitas (token login, atau `X-API-Key` + `X-User-Id`). Admin melihat data semua user; user biasa hanya miliknya.
 
 | Method | URL | Keterangan |
 |---|---|---|
 | GET | `/` | `Server is running` |
 | GET | `/health` | `{ status: ok }` |
 | GET | `/api/ping` | `{ message: pong }` |
+| POST | `/api/auth/register` | Daftar akun (role `user`) + token. Terbuka |
+| POST | `/api/auth/login` | Login + token. Terbuka |
+| POST | `/api/auth/refresh` | Tukar refresh token dengan pasangan token baru. Terbuka |
+| GET | `/api/auth/me` | Akun yang sedang login (butuh access token) |
 | GET | `/api/skills` | Daftar skill yang terpasang |
 | POST | `/api/skills/upload` | Upload skill dalam bentuk zip |
 | GET | `/api/skills/export?names=a,b` | Download zip skill yang terpasang (tanpa `names` = semua) |
@@ -144,12 +168,22 @@ Bila port 6380 tidak bisa dijangkau setelah container jalan, buka port itu di fi
 | GET | `/api/skills/preview/:name?model=...&budget=...` | Teks skill persis seperti yang akan disisipkan (sudah dibersihkan dan sesuai budget) |
 | POST | `/v1/chat/completions` | Proxy ke 9Router; skill yang relevan, context pack aktif, dan catatan memori yang cocok disisipkan ke system prompt |
 | ANY | `/v1/*` | Proxy polos ke 9Router (mis. `/v1/models`) |
-| GET | `/api/usage-logs?page=&limit=&model=&skill=` | Daftar log pemakaian, terbaru lebih dulu |
+| GET | `/api/usage-logs?page=&limit=&model=&skill=&user_id=` | Daftar log pemakaian, terbaru lebih dulu (user: miliknya; admin: semua, bisa difilter `user_id`) |
 | GET | `/api/usage-logs/summary?from=&to=` | Ringkasan per skill (request, rata-rata token tambahan, token, latensi), hit/miss cache, varian skill, dan penyisipan memori |
-| POST | `/api/evals/runs` | Mulai eval skill (berjalan di latar belakang), body `{"skill":"...","variants":["full","short","none"]}` |
+| POST | `/api/evals/runs` | Mulai eval skill (berjalan di latar belakang), body `{"skill","model","judge_model","variants","limit"}` + header `X-Router-URL`/`X-Router-Key` |
 | GET | `/api/evals/runs?skill=&limit=` | Daftar eval terbaru |
 | GET | `/api/evals/runs/:id?detail=true` | Hasil eval per varian beserta kesimpulannya |
-| GET | `/api/mcp/servers` | Status server MCP (Canva, Figma, ...) dan link login |
+| GET | `/api/mcp/servers` | Server MCP yang terlihat user (bawaan, dari admin, pribadi) + status dan link login (`global`, `shared_login`) |
+| POST | `/api/mcp/servers` | Tambah server: dari admin = untuk semua user (`shared_login`), dari user = pribadi |
+| DELETE | `/api/mcp/servers/:name` | Hapus server pribadi (server admin hanya oleh admin) |
+| GET | `/api/mcp/admin/servers` | **Admin:** server tambahan dan status login semua user |
+| POST | `/api/mcp/installs/analyze` | Pasang MCP dari GitHub: unduh & periksa repo (tanpa dijalankan) |
+| POST / GET | `/api/mcp/installs` | Ajukan pemasangan / daftar pemasangan (milik sendiri + dari admin) |
+| GET / DELETE | `/api/mcp/installs/:id` | Detail / hapus pemasangan |
+| POST | `/api/mcp/installs/:id/approve` · `/reject` | **Admin:** setujui / tolak pengajuan user |
+| POST | `/api/mcp/installs/:id/start` · `/stop` | Jalankan / hentikan container |
+| GET | `/api/mcp/installs/:id/logs` | Log container |
+| GET / POST | `/api/mcp/installs/:id/env?u=&exp=&sig=` | Form data rahasia (link dari chat) |
 | GET | `/api/mcp/servers/:name/connect` | Login OAuth server MCP (buka di browser) |
 | POST | `/api/mcp/servers/:name/refresh` | Ambil ulang daftar tool server MCP |
 | DELETE | `/api/mcp/servers/:name/connection` | Hapus login server MCP |
@@ -158,6 +192,7 @@ Bila port 6380 tidak bisa dijangkau setelah container jalan, buka port itu di fi
 | GET | `/images/:file` | Gambar hasil `generate_image` (link yang muncul di jawaban chat) |
 | GET | `/api/images?q=&page=&limit=` | Daftar gambar yang pernah dibuat (URL, prompt, alt, model) dari tabel `t_generated_images` |
 | GET | `/api/images/:id` | Detail satu gambar |
+| GET | `/api/web-search?q=` | Cek pencarian web lewat SearXNG |
 | GET | `/api/context-packs` | Daftar context pack |
 | POST | `/api/context-packs` | Buat context pack, body `{"name","content","active"}` |
 | GET / PUT / DELETE | `/api/context-packs/:id` | Lihat, ubah (field yang dikirim saja), atau hapus context pack |
@@ -222,7 +257,7 @@ Catatan:
 Skill dipilih tanpa LLM: BM25 pada gabungan `name` (bobot 3), `keywords` (bobot 2), dan `description`. Hanya satu skill teratas yang dipilih, dan hanya bila skornya mencapai `SKILL_MIN_SCORE` (default `2.0`). Sapaan dan ucapan terima kasih ("halo", "terima kasih") tidak menghasilkan skor, jadi tidak mendapat skill.
 
 ```bash
-curl "http://localhost:4000/api/skills/match?q=berapa+harga+yang+pas+untuk+produk+saya"
+curl "http://localhost:4000/api/skills/match?q=berapa+harga+yang+pas+untuk+produk+saya" -H "X-API-Key: <API_KEYS>"
 ```
 
 ```json
@@ -351,12 +386,13 @@ Catatan:
 
 ## Memori (Context Pack dan Catatan)
 
-Tahap 4 menambahkan dua jenis memori. Keduanya **global** (tidak terikat user) dan disimpan di PostgreSQL.
+Tahap 4 menambahkan dua jenis memori. Keduanya **per user** (kolom `user_id`) dan disimpan di PostgreSQL: context pack dan catatan milik user A tidak pernah disisipkan ke chat user B. Di endpoint `/api/*`, admin bisa melihat dan mengelola milik semua user, tetapi chat admin tetap hanya memakai miliknya sendiri.
 
 **1. Context pack (`m_context_packs`)**: ringkasan tetap yang selalu relevan, misalnya gambaran bisnis, istilah, atau aturan yang berlaku. Semua context pack yang aktif disisipkan di setiap request setelah skill, diurutkan menurut nama, dan dibatasi `CONTEXT_PACK_MAX_TOKENS` (dipotong di batas paragraf). Teksnya di-cache di memori selama 30 detik, dan perubahan lewat API langsung mengosongkan cache. Bila database gagal dibaca, teks terakhir tetap dipakai.
 
 ```bash
 curl -X POST http://localhost:4000/api/context-packs -H "Content-Type: application/json" \
+  -H "X-API-Key: <API_KEYS>" -H "X-User-Id: user-123" \
   -d '{"name":"bisnis","content":"Kedai kopi di Bandung, jual kopi susu literan via Instagram dan GoFood. Target: mahasiswa."}'
 ```
 
@@ -369,9 +405,9 @@ curl -X POST http://localhost:4000/api/context-packs -H "Content-Type: applicati
 
 ```bash
 # catatan usulan yang menunggu konfirmasi
-curl "http://localhost:4000/api/memory-notes?status=proposed"
+curl "http://localhost:4000/api/memory-notes?status=proposed" -H "X-API-Key: <API_KEYS>" -H "X-User-Id: user-123"
 # catatan apa yang akan ikut untuk sebuah pesan
-curl "http://localhost:4000/api/memory-notes/match?q=mau+promo+diskon+50%25+lagi"
+curl "http://localhost:4000/api/memory-notes/match?q=mau+promo+diskon+50%25+lagi" -H "X-API-Key: <API_KEYS>" -H "X-User-Id: user-123"
 ```
 
 Contoh hasil uji nyata: setelah ada catatan "promo diskon 50% kopi susu: penjualan naik 2x tapi rugi Rp1,2 juta", pertanyaan "aku mau bikin promo diskon 50% lagi" dijawab model dengan menyebut hasil itu lebih dulu, lalu menyarankan bundling atau diskon 15-20%.
@@ -408,13 +444,21 @@ Client ──chat──▶ middleware ──(chat + tool yang cocok)──▶ 9R
 - `keywords`: kata yang ikut dicocokkan dengan pesan user saat memilih tool.
 - `headers`: untuk server ber-API key. `${NAMA_ENV}` diambil dari `.env`, supaya rahasia tidak tertulis di `mcp.json`.
 - `"enabled": false` mematikan sebuah server.
-- Yang didukung hanya server MCP HTTP (Streamable HTTP), bukan server lokal `npx`/stdio.
+- Yang didaftarkan di sini hanya server MCP HTTP (Streamable HTTP). Server `npx`/stdio dari GitHub dipasang lewat [Pasang MCP dari GitHub](#pasang-mcp-dari-github-lewat-chat), yang menjalankannya di container dan membungkusnya menjadi HTTP.
 
-**2. Login sekali per server (OAuth)**: buka `http://<BASE_URL>/api/mcp/servers/canva/connect` di browser, lalu login dan setujui akses. Middleware otomatis mencari alamat login, mendaftarkan dirinya sebagai aplikasi OAuth, dan memakai PKCE. Akun yang dipakai adalah **satu akun bersama** untuk semua chat. Token disimpan terenkripsi (`MCP_TOKEN_KEY`) di `m_mcp_credentials` dan diperpanjang otomatis. `BASE_URL` harus bisa dibuka dari browser, karena halaman login kembali ke `BASE_URL/api/mcp/oauth/callback`.
+**2. Login sekali per server (OAuth)**: buka `http://<BASE_URL>/api/mcp/servers/canva/connect` di browser, lalu login dan setujui akses. Middleware otomatis mencari alamat login, mendaftarkan dirinya sebagai aplikasi OAuth, dan memakai PKCE. Setiap user login ke **akunnya sendiri** (kecuali server admin dengan login bersama, lihat di bawah). Token disimpan terenkripsi (`MCP_TOKEN_KEY`) di `m_mcp_credentials` dan diperpanjang otomatis. `BASE_URL` harus bisa dibuka dari browser, karena halaman login kembali ke `BASE_URL/api/mcp/oauth/callback`.
 
-**MCP per user:** server bawaan ada di `mcp.json` (untuk semua user), server tambahan disimpan per user di `m_mcp_servers`, dan tiap user login ke akunnya sendiri (token di `m_mcp_credentials` per user). Link login dari chat ditandatangani supaya tidak bisa dipakai untuk user lain.
+**Tiga jenis server MCP:**
 
-**Kelola MCP lewat chat:** "mcp apa aja yang tersambung?", "konekan saya ke canva" (diberi link login), "tambahkan MCP notion, url-nya https://..." (URL dicek, disimpan sebagai server milik user itu, langsung aktif), dan "hapus MCP notion". Tool bawaan: `list_connections`, `connect_service`, `add_mcp_server`, `remove_mcp_server`. Detail di [`docs/10-mcp.md`](docs/10-mcp.md).
+| Jenis | Dibuat | Berlaku untuk | Login |
+|---|---|---|---|
+| Bawaan | `mcp.json` (butuh restart) | semua user | tiap user login sendiri |
+| Dari admin | admin lewat chat / `POST /api/mcp/servers` (tanpa restart) | **semua user** | dipilih admin: `shared_login: true` = semua memakai login admin (cocok untuk GitHub/database organisasi); `false` = tiap user login sendiri (Canva/Figma pribadi) |
+| Pribadi | user biasa lewat chat / API | hanya user itu | user itu sendiri |
+
+Token login tersimpan per (user, server) di `m_mcp_credentials`. Link login dari chat ditandatangani supaya tidak bisa dipakai untuk user lain. Login bersama hanya bisa diurus admin pembuatnya; user lain tidak diberi link login. Server admin hanya bisa dihapus admin.
+
+**Kelola MCP lewat chat:** "mcp apa aja yang tersambung?", "konekan saya ke canva" (diberi link login), "tambahkan MCP notion, url-nya https://..." (URL dicek, langsung aktif: pribadi bila diminta user biasa, untuk semua user bila diminta admin), dan "hapus MCP notion". Tool bawaan: `list_connections`, `connect_service`, `add_mcp_server`, `remove_mcp_server`. Detail di [`docs/10-mcp.md`](docs/10-mcp.md).
 
 **3. Setelah itu berjalan sendiri di setiap chat:**
 - Tool dipilih **otomatis sesuai pesan** (BM25 pada nama server, `keywords`, nama dan deskripsi tool, dari dua pesan user terakhir). Maksimal `MCP_MAX_TOOLS` tool dengan skor ≥ `MCP_TOOL_MIN_SCORE`.
@@ -424,8 +468,10 @@ Client ──chat──▶ middleware ──(chat + tool yang cocok)──▶ 9R
 - Bila client sudah membawa `tools` sendiri, tool MCP tidak ditambahkan.
 
 ```bash
-curl http://localhost:4000/api/mcp/servers                                        # status + link login
-curl "http://localhost:4000/api/mcp/tools?q=buatkan+poster+promo+di+canva"        # tool yang akan terpilih
+# status + link login
+curl http://localhost:4000/api/mcp/servers -H "X-API-Key: <API_KEYS>" -H "X-User-Id: user-123"
+# tool yang akan terpilih untuk sebuah pesan
+curl "http://localhost:4000/api/mcp/tools?q=buatkan+poster+promo+di+canva" -H "X-API-Key: <API_KEYS>" -H "X-User-Id: user-123"
 ```
 
 Catatan:
@@ -436,6 +482,33 @@ Catatan:
 - Respons yang membawa tool diberi header `X-MCP-Tools`. Pemakaian tool dicatat di `t_usage_logs` (`mcp_tools_offered`, `mcp_tool_calls`, `mcp_tool_names`, `mcp_steps`) dan diringkas di bagian `mcp` pada `/api/usage-logs/summary`.
 
 Penjelasan lengkap: [`docs/10-mcp.md`](docs/10-mcp.md).
+
+## Pasang MCP dari GitHub lewat Chat
+
+Chat: *"tolong pasangkan https://github.com/bytebase/dbhub jadi MCP"*. Alurnya:
+
+1. **Analisis.** Repo diunduh ke `open_source_mcp/<owner>__<repo>`, dikunci ke satu commit, dan diperiksa (package.json, pyproject, `.env.example`, README). **Tidak ada kode yang dijalankan.**
+2. **Konfirmasi.** AI menjelaskan rencana (nama, perintah install & start, nama variabel rahasia seperti `DSN`), lalu user mengonfirmasi.
+3. **Persetujuan.** Pengajuan user biasa disimpan di `m_mcp_installs` dengan status `pending_review` (tidak hilang walau admin lama tidak membukanya) sampai admin menyetujui/menolak (*"setujui pemasangan dbhub"* atau API). Pengajuan admin langsung disetujui dan berlaku untuk semua user, dengan pilihan **wajib**:
+   - **sharing**: satu container berisi data rahasia admin dipakai semua user;
+   - **tidak sharing**: jadi template; tiap user mengisi data rahasianya sendiri dan mendapat container sendiri (`m_mcp_install_instances`), tanpa persetujuan lagi.
+4. **Data rahasia** (password, DSN, token) diisi lewat **link form** bertanda tangan (24 jam), bukan di chat, lalu disimpan terenkripsi (`MCP_TOKEN_KEY`).
+5. **Jalan.** Container `mcpx-<nama>` dari image `docker/mcp-runner` meng-clone commit yang disetujui, menjalankan perintah install, lalu menjalankan server (stdio dibungkus supergateway menjadi HTTP). Begitu siap, server langsung terdaftar dan tool-nya bisa dipakai di chat.
+
+Isolasi container: bukan root, semua capability dibuang, `no-new-privileges`, tanpa folder VPS, dibatasi memori/CPU/proses (`MCP_RUNNER_*`), hanya di network `middleware_mcp_net`, dan env middleware (password DB, `JWT_SECRET`, ...) tidak pernah ikut. Middleware memanggil Docker lewat `docker-proxy`, bukan socket Docker langsung. Bila container gagal, ia dihentikan dan log terakhirnya dicatat; middleware tetap jalan.
+
+Tool chat: `install_mcp_from_github` (`analyze`, `submit`) dan `manage_mcp_install` (`list`, `env_link`, `start`, `stop`, `remove`, admin: `approve`, `reject`). Fitur mati bila `MCP_DOCKER_HOST` kosong (di docker-compose otomatis aktif). Penjelasan lengkap, batas keamanan, dan cara menyalakan di laptop: [`docs/13-pasang-mcp-dari-github.md`](docs/13-pasang-mcp-dari-github.md).
+
+## Pencarian Web lewat Chat
+
+Tool bawaan **`web_search`** mencari di internet lewat **SearXNG** yang dijalankan sendiri (service `searxng` di docker-compose, tanpa API key). Tool hanya ditawarkan bila pesan butuh info dari web (cari, terbaru, berita, tren, pesaing, kompetitor, referensi, riset, link, ...). Model menulis query singkat, boleh beberapa kali, lalu menjawab dengan sumbernya.
+
+- `WEB_SEARCH_URL` (di Docker otomatis `http://searxng:8080`; kosong = mati), `WEB_SEARCH_MAX_RESULTS` (bawaan 8), `WEB_SEARCH_TIMEOUT` (bawaan 15 detik).
+- Cek manual: `GET /api/web-search?q=harga+kopi+susu+bandung`.
+
+## Buat Skill lewat Chat
+
+Chat: *"buatkan skill meta-ads untuk kedai kopi"*. Tool bawaan **`create_skill`** (ditawarkan bila pesan berisi kata "skill" dan kata kerja seperti buat/bikin/tulis/cari) membuat model menulis isi `SKILL.md` (dan `SHORT.md` opsional). Middleware menyusun frontmatter yang benar (`name`, `description`, `keywords`), memasangnya lewat proses upload yang sama, lalu chat membalas dengan link **Download zip**. Skill baru langsung bisa terpilih di chat berikutnya. Skill dengan nama sama tidak ditimpa tanpa persetujuan user. Bisa digabung dengan `web_search` untuk riset dulu sebelum menulis skill.
 
 ## Gambar lewat Chat
 
@@ -448,6 +521,68 @@ Chat seperti "buatkan gambar logo kedai kopi, minimalis warna coklat" bisa mengh
 
 Model gambar **tidak ditulis di `.env`**: daftarnya diambil otomatis dari akun 9Router user (`GET /v1/models/image`, di-cache 10 menit per akun) lalu dicoba berurutan; model yang menolak dilewati sementara. Akun tanpa model gambar tidak ditawari tool ini. Saat ini `cx/gpt-image-*` butuh ChatGPT Plus/Pro pada akun yang terhubung ke 9Router, dan `ag/gemini-3.1-flash-image` (gratis) sering penuh. `BASE_URL` harus bisa dibuka aplikasi chat supaya gambar tampil. Penjelasan lengkap: [`docs/11-gambar.md`](docs/11-gambar.md).
 
+## Akun, Login, dan Role
+
+Untuk user yang tidak punya aplikasi pihak ketiga (mis. lewat web middleware AI). Tabel `m_users` berisi `id`, `email`, `password` (bcrypt), dan `role` (`user`/`admin`).
+
+| Endpoint | Hasil |
+|---|---|
+| `POST /api/auth/register` `{"email","password"}` | akun **selalu role `user`** + token (field `role` diabaikan). 409 bila email terdaftar |
+| `POST /api/auth/login` | token (401 `Email atau password salah`, pesan sama untuk email tidak ada) |
+| `POST /api/auth/refresh` `{"refresh_token"}` | pasangan token baru (role dibaca ulang dari database) |
+| `GET /api/auth/me` | akun yang sedang login |
+
+- Access token 15 menit (`JWT_ACCESS_TTL`), refresh token 30 hari (`JWT_REFRESH_TTL`), JWT HS256 dengan `JWT_SECRET`. Refresh token tidak bisa dipakai sebagai access token.
+- Refresh token tidak disimpan di database, jadi tidak bisa dicabut satu per satu. Mengganti `JWT_SECRET` mencabut semua token.
+- Register **selalu** menghasilkan role `user`, walaupun body berisi `"role":"admin"`. Register terbuka tanpa key/token, jadi role admin sengaja tidak bisa dipilih di sini supaya orang lain tidak bisa mendaftar sendiri sebagai admin.
+- **Admin dibuat langsung di database** (lihat contoh di bawah), atau dari `ADMIN_EMAIL`/`ADMIN_PASSWORD` di `.env` saat start.
+- SDK OpenAI bisa langsung dipakai: isi `api_key` dengan access token. `Authorization` berisi bukan-JWT (mis. `sk-...`) diabaikan dan pemeriksaan pindah ke `X-API-Key`.
+
+**Contoh: register user biasa**
+
+```bash
+curl -X POST http://localhost:4000/api/auth/register -H "Content-Type: application/json" \
+  -d '{"email":"budi@contoh.com","password":"rahasia123"}'
+```
+
+**Contoh: membuat admin (lewat database)**
+
+```bash
+# 1. register seperti biasa (hasilnya role user)
+curl -X POST http://localhost:4000/api/auth/register -H "Content-Type: application/json" \
+  -d '{"email":"pemilik@contoh.com","password":"password-admin-yang-kuat"}'
+```
+
+```sql
+-- 2. naikkan jadi admin langsung di PostgreSQL (psql, DBeaver, pgAdmin, ...)
+UPDATE m_users SET role = 'admin' WHERE email = 'pemilik@contoh.com';
+
+-- cek
+SELECT id, email, role FROM m_users WHERE email = 'pemilik@contoh.com';
+
+-- menurunkan lagi jadi user
+UPDATE m_users SET role = 'user' WHERE email = 'pemilik@contoh.com';
+```
+
+```bash
+# 3. login ulang supaya token membawa role admin
+curl -X POST http://localhost:4000/api/auth/login -H "Content-Type: application/json" \
+  -d '{"email":"pemilik@contoh.com","password":"password-admin-yang-kuat"}'
+#    -> data.user.role = "admin", data.access_token = "eyJ..."
+
+# 4. pastikan role-nya admin
+curl http://localhost:4000/api/auth/me -H "Authorization: Bearer <access_token>"
+
+# contoh pakai token admin: lihat pengajuan MCP dari user yang menunggu persetujuan
+curl "http://localhost:4000/api/mcp/installs?status=pending_review" -H "Authorization: Bearer <access_token>"
+```
+
+Role tersimpan di dalam token, jadi perubahan role lewat database baru berlaku setelah **login ulang** atau **refresh token** (access token lama tetap membawa role lama sampai kedaluwarsa, paling lama 15 menit). Email di database tersimpan huruf kecil.
+
+Cara lain: isi `ADMIN_EMAIL`/`ADMIN_PASSWORD` di `.env` lalu restart; akun admin dibuat otomatis saat start (log `akun admin dibuat`).
+
+Detail: [`docs/12-akun-dan-login.md`](docs/12-akun-dan-login.md).
+
 ## Index Skill
 
 Saat start, middleware membaca `skills/*/SKILL.md` dan menyimpan `name`, `description`, `keywords`, serta ada tidaknya `SHORT.md` di memori. Isi skill tidak disimpan di index; dibaca dari disk saat skill terpilih.
@@ -459,12 +594,12 @@ Saat start, middleware membaca `skills/*/SKILL.md` dan menyimpan `name`, `descri
 
 ## Impor Skill dari GitHub lewat Chat
 
-Tulis di chat: *"ambil skill dari https://github.com/owner/repo lalu jadikan zip"*. Tool bawaan **`import_skills_from_github`** (hanya ditawarkan bila pesan berisi link `github.com`) mengunduh repo, menyusun setiap folder ber-`SKILL.md` (di kedalaman berapa pun) menjadi zip skill yang rapi, memasangnya lewat proses upload yang sama (hanya file teks), lalu chat membalas dengan daftar skill dan link **Download zip** (`/api/skills/export?names=...`). Skill yang sudah ada tidak ditimpa tanpa persetujuan user. Saat ini semua user chat boleh memasang skill. Detail: [`docs/03-skill.md`](docs/03-skill.md).
+Tulis di chat: *"ambil skill dari https://github.com/owner/repo lalu jadikan zip"*. Tool bawaan **`import_skills_from_github`** (hanya ditawarkan bila pesan berisi link `github.com`) mengunduh repo, menyusun setiap folder ber-`SKILL.md` (di kedalaman berapa pun) menjadi zip skill yang rapi, memasangnya lewat proses upload yang sama (hanya file teks), lalu chat membalas dengan daftar skill dan link **Download zip** (`/api/skills/export?names=...`). Skill yang sudah ada tidak ditimpa tanpa persetujuan user. Semua user boleh memasang skill, dan skill berlaku untuk semua user. Detail: [`docs/03-skill.md`](docs/03-skill.md).
 
 ## Daftar Skill
 
 ```bash
-curl http://localhost:4000/api/skills
+curl http://localhost:4000/api/skills -H "X-API-Key: <API_KEYS>"
 ```
 
 Mengembalikan array di `data`, terurut menurut nama: `name`, `description` (dari frontmatter), `files`, `has_short`, `size_bytes`, dan `updated_at` (waktu ubah file terbaru). Folder berawalan `.` (staging/backup upload) tidak ikut. Skill yang `SKILL.md`-nya hilang atau frontmatter-nya rusak tetap muncul dengan field `error`.
@@ -472,7 +607,7 @@ Mengembalikan array di `data`, terurut menurut nama: `name`, `description` (dari
 ## Upload Skill (zip)
 
 ```bash
-curl -X POST http://localhost:4000/api/skills/upload \
+curl -X POST http://localhost:4000/api/skills/upload -H "X-API-Key: <API_KEYS>" \
   -F "file=@copywriting.zip" \
   -F "overwrite=false"
 ```
@@ -485,7 +620,7 @@ curl -X POST http://localhost:4000/api/skills/upload \
 - Hanya file teks yang dipasang (`.md .txt .json .yaml .yml .csv`). Script dan file lain dibuang dan dilaporkan di `skipped_files`.
 - Pemasangan atomik: diekstrak ke folder staging (`.upload-*`) dulu, baru di-rename. Skill yang diganti dibackup sementara (`.old-*`) dan dipulihkan bila ada yang gagal. Loader skill harus mengabaikan folder berawalan `.`.
 - Dilindungi dari zip slip, symlink, dan zip bomb (maks 500 file, 2 MB per file, 20 MB total setelah diekstrak).
-- Endpoint ini tidak memakai autentikasi.
+- Butuh token login atau `X-API-Key` seperti endpoint lain. Skill yang dipasang berlaku untuk semua user.
 
 ## Amplop Respons
 
@@ -502,7 +637,13 @@ Bentuk seragam untuk respons API (dipakai `internal/pkg/response`):
 ## Catatan Desain
 
 - **Middleware global**: `Recovery` (panic -> 500 amplop), `HTTPLogger`
-  (request log ke zap), `CORS`.
+  (request log ke zap), `CORS` (mengizinkan `Authorization`, `X-API-Key`, `X-Router-URL`,
+  `X-Router-Key`, `X-User-Id`, `X-Conversation-Id`), dan `Auth` (token login atau `X-API-Key`).
+- **Data per user**: `userctx.Scope` + `database.ByUser`: admin = semua data, user = miliknya.
+  Sisipan chat (context pack, catatan) selalu milik user yang chat sendiri.
+- **9Router milik user**: alamat, key, dan model dibawa di context request sampai ke semua
+  panggilan turunan (tool, gambar, pemilih cadangan, ekstraksi memori di latar belakang, eval).
+  Alamat ke jaringan internal ditolak (`ROUTER_ALLOW_PRIVATE_NETWORK=false`).
 - **Error handling terpusat**: `apperror.Handle` memetakan `AppError`,
   `gorm.ErrRecordNotFound`, dan unique-violation PostgreSQL ke amplop yang sesuai.
 - **Logging** zap menulis `logs/combined.log` (info+) & `logs/error.log` (error+),
@@ -518,3 +659,10 @@ Bentuk seragam untuk respons API (dipakai `internal/pkg/response`):
 | 3 | Embedding, pemilih cadangan, pengukuran skill terpakai, eval | selesai; embedding menunggu provider (`EMBEDDING_MODEL`) |
 | 4 | Context pack, catatan pelajaran, ekstraksi di latar belakang | selesai |
 | + | MCP: middleware menjadi klien MCP karena 9Router tidak bisa (lihat `docs/10-mcp.md`) | selesai; Canva siap login, Figma resmi menolak pendaftaran klien |
+| + | 9Router milik user: `X-Router-URL`, `X-Router-Key`, `model` dari client; tidak ada key/model/alamat di `.env` | selesai |
+| + | Data per user (`X-User-Id`) dan secret aplikasi `API_KEYS` | selesai |
+| + | Akun: register, login, refresh token, role admin/user (admin lihat semua data) | selesai |
+| + | MCP dari admin berlaku untuk semua user (`shared_login`), MCP pribadi per user | selesai |
+| + | Gambar lewat chat (model gambar dari akun 9Router user) | selesai |
+| + | Pencarian web (SearXNG), buat skill lewat chat, impor skill dari GitHub | selesai |
+| + | Pasang MCP dari GitHub: persetujuan admin, form rahasia, container Docker terpisah, sharing / tidak sharing | selesai; diuji dengan Docker palsu, belum dengan container sungguhan |

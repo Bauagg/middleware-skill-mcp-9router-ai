@@ -30,12 +30,24 @@ Tabel dibuat otomatis saat server start.
 | `user` | Akun yang register, dan **semua** user dari aplikasi pihak ketiga | Hanya miliknya sendiri |
 
 - **Skill selalu global**: semua role melihat dan memakai skill yang sama.
+- **Server MCP buatan admin juga global**: berlaku untuk semua user, dengan login bersama milik admin atau login masing-masing (lihat [MCP](10-mcp.md#server-dari-admin-untuk-semua-user)). Server MCP buatan user biasa tetap pribadi. MCP dari GitHub yang dipasang admin juga global, dengan pilihan sharing atau tidak sharing (lihat [Pasang MCP dari GitHub](13-pasang-mcp-dari-github.md#sharing-atau-tidak-khusus-pemasangan-admin)).
 - **Chat tetap pribadi**: saat admin chat, yang disisipkan tetap context pack dan catatan milik admin sendiri, bukan milik semua user.
 - Data baru (context pack, catatan, dan lainnya) selalu tercatat atas nama pembuatnya.
 
 ### Membuat admin
 
-Register biasa **selalu** menghasilkan role `user`, supaya orang lain tidak bisa mendaftar sebagai admin. Akun admin dibuat dari `.env` saat server start:
+Register **selalu** menghasilkan role `user`; field `role` di body diabaikan. Register terbuka tanpa key/token, jadi role admin sengaja tidak bisa dipilih di sana. Ada dua cara membuat admin:
+
+**1. Langsung di database:** register seperti biasa, lalu naikkan role-nya di PostgreSQL.
+
+```sql
+UPDATE m_users SET role = 'admin' WHERE email = 'pemilik@contoh.com';
+-- menurunkan lagi: UPDATE m_users SET role = 'user' WHERE email = 'pemilik@contoh.com';
+```
+
+Role tersimpan di dalam token, jadi perubahan baru berlaku setelah user **login ulang** atau **refresh token**. Access token lama tetap membawa role lama sampai kedaluwarsa, paling lama `JWT_ACCESS_TTL` (15 menit). Email tersimpan huruf kecil.
+
+**2. Dari `.env` saat server start:**
 
 ```env
 ADMIN_EMAIL=pemilik@contoh.com
@@ -54,7 +66,7 @@ Register, login, dan refresh **tidak** butuh `X-API-Key`, karena dipanggil dari 
 
 | Method | URL | Body | Hasil |
 |---|---|---|---|
-| POST | `/api/auth/register` | `{"email","password"}` (password 8–72 karakter) | 201 + akun + token. 409 bila email sudah terdaftar. |
+| POST | `/api/auth/register` | `{"email","password"}` (password 8–72 karakter) | 201 + akun (selalu role `user`) + token. 409 bila email sudah terdaftar. |
 | POST | `/api/auth/login` | `{"email","password"}` | 200 + akun + token. 401 `Email atau password salah`. |
 | POST | `/api/auth/refresh` | `{"refresh_token"}` | 200 + pasangan token baru. 401 bila tidak valid atau kedaluwarsa. |
 | GET | `/api/auth/me` | header `Authorization: Bearer <access_token>` | akun yang sedang login |

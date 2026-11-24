@@ -22,6 +22,9 @@ logs/*.log
 # Gambar hasil generate lewat chat (dibuat otomatis)
 /images/
 
+# Clone repo MCP dari GitHub yang dipasang lewat chat (dibuat otomatis)
+/open_source_mcp/
+
 # Go workspace / vendor
 vendor/
 go.work

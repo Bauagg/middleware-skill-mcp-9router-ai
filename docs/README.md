@@ -26,6 +26,7 @@ Bagi client, middleware ini terlihat sama persis seperti 9Router (format OpenAI)
 | 10 | [MCP](10-mcp.md) | Koneksi ke Canva, Figma, dan server MCP lain: login OAuth, pemilihan tool, putaran panggil-tool |
 | 11 | [Gambar lewat chat](11-gambar.md) | Tool bawaan `generate_image`: chat "buatkan gambar ..." menghasilkan gambar yang tampil di jawaban |
 | 12 | [Akun, login, dan role](12-akun-dan-login.md) | Register/login/refresh token, role admin dan user, siapa melihat data siapa |
+| 13 | [Pasang MCP dari GitHub](13-pasang-mcp-dari-github.md) | Chat "pasangkan repo ini jadi MCP": analisis, persetujuan admin, data rahasia lewat form, container Docker terpisah |
 
 ## Ringkasan cepat
 
