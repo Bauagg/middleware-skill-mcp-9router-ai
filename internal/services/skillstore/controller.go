@@ -139,3 +139,26 @@ func (h *Controller) Upload(c *gin.Context) {
 
 	response.Created(c, result, "Skill berhasil diupload")
 }
+
+// Export menangani GET /api/skills/export?names=a,b : zip berisi skill yang
+// terpasang (names kosong = semua skill). Link ini juga diberikan chat
+// setelah skill diimpor dari GitHub.
+func (h *Controller) Export(c *gin.Context) {
+	var names []string
+	for _, n := range strings.Split(c.Query("names"), ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			names = append(names, n)
+		}
+	}
+	data, err := h.service.Export(names)
+	if err != nil {
+		apperror.Handle(c, err)
+		return
+	}
+	file := "skills.zip"
+	if len(names) == 1 {
+		file = names[0] + ".zip"
+	}
+	c.Header("Content-Disposition", `attachment; filename="`+file+`"`)
+	c.Data(http.StatusOK, "application/zip", data)
+}

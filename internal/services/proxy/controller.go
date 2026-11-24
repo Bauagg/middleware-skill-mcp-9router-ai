@@ -14,6 +14,7 @@ import (
 
 	"github.com/Bauagg/middleware-skill-ai/internal/clients"
 	"github.com/Bauagg/middleware-skill-ai/internal/logger"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/userctx"
 )
 
 // maxBodyBytes membatasi body chat completions yang dibaca ke memori
@@ -33,10 +34,38 @@ func NewController(service *Service) *Controller {
 // Handle menangani semua request /v1/*. POST /v1/chat/completions disisipi
 // skill lebih dulu; path lain diteruskan polos ke 9Router.
 func (h *Controller) Handle(c *gin.Context) {
+	// key 9Router milik user wajib untuk semua /v1/*: middleware tidak
+	// memakai key-nya sendiri untuk request client
+	key := userctx.RouterKeyFromHeader(c)
+	if key == "" {
+		c.Data(http.StatusUnauthorized, "application/json", clients.OpenAIErrorBody(
+			"header "+userctx.RouterKeyHeader+" wajib diisi dengan key 9Router milikmu", "invalid_api_key"))
+		return
+	}
+	// alamat 9Router juga milik user: setiap user punya domain 9Router sendiri
+	base, err := clients.ParseRouterURL(userctx.RouterURLFromHeader(c))
+	if err != nil {
+		c.Data(http.StatusBadRequest, "application/json", clients.OpenAIErrorBody(
+			"header "+userctx.RouterURLHeader+" wajib berisi alamat 9Router milikmu, mis. https://host/v1: "+err.Error(),
+			"invalid_request_error"))
+		return
+	}
+	c.Request = c.Request.WithContext(userctx.WithRouterURL(userctx.WithRouterKey(c.Request.Context(), key), base))
+
 	if c.Request.Method != http.MethodPost || c.Param("path") != "/chat/completions" {
 		h.service.Forward(c.Writer, c.Request)
 		return
 	}
+
+	// chat wajib membawa user_id: memori, gambar, log, dan MCP dipisah per user
+	// user dari token login bila ada, selain itu dari header X-User-Id
+	user := userctx.Resolve(c)
+	if !userctx.Valid(user) {
+		c.Data(http.StatusBadRequest, "application/json", clients.OpenAIErrorBody(
+			"header "+userctx.Header+" wajib diisi (huruf, angka, . _ @ : -, maks 128)", "invalid_request_error"))
+		return
+	}
+	c.Request = c.Request.WithContext(userctx.With(c.Request.Context(), user))
 
 	start := time.Now()
 
@@ -54,7 +83,7 @@ func (h *Controller) Handle(c *gin.Context) {
 		result = h.service.Forward(c.Writer, c.Request)
 	}
 	h.service.RecordUsage(prepared, result, time.Since(start))
-	h.service.Learn(prepared)
+	h.service.Learn(c.Request.Context(), prepared)
 }
 
 // injectSkill membaca body, menyisipkan skill, lalu menggantinya pada request.
@@ -74,15 +103,23 @@ func (h *Controller) injectSkill(c *gin.Context) (*Prepared, bool) {
 
 	// bila error, prepared tetap berisi body asli (dan model/stream yang terbaca)
 	meta := RequestMeta{
-		Authorization:  c.GetHeader("Authorization"),
+		UserID:         userctx.From(c.Request.Context()),
 		ConversationID: c.GetHeader("X-Conversation-Id"),
 	}
 	prepared, err := h.service.Prepare(c.Request.Context(), raw, meta)
+	if errors.Is(err, ErrModelRequired) {
+		c.Data(http.StatusBadRequest, "application/json", clients.OpenAIErrorBody(
+			"field model wajib diisi dengan model 9Router milikmu", "invalid_request_error"))
+		c.Abort()
+		return nil, false
+	}
 	if err != nil {
 		// skill hanya bonus: request tetap diteruskan apa adanya
 		logger.Warn("skill tidak disisipkan, request diteruskan tanpa perubahan", zap.Error(err))
 	}
 
+	// ekstraksi memori setelah respons memakai model yang sama dengan chat ini
+	c.Request = c.Request.WithContext(userctx.WithRouterModel(c.Request.Context(), prepared.Model))
 	c.Request.Body = io.NopCloser(bytes.NewReader(prepared.Body))
 	c.Request.ContentLength = int64(len(prepared.Body))
 	c.Request.Header.Set("Content-Length", strconv.Itoa(len(prepared.Body)))

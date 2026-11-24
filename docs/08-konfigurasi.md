@@ -17,6 +17,16 @@
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `LOG_DIR` | `logs` | Folder file log |
 
+## Secret key (wajib)
+
+| Variabel | Bawaan | Keterangan |
+|---|---|---|
+| `JWT_SECRET` | - | **Wajib.** Kunci tanda tangan token login, minimal 32 karakter (`openssl rand -hex 32`). Mengganti nilainya membuat semua token lama tidak berlaku. |
+| `JWT_ACCESS_TTL` | `15m` | Umur access token |
+| `JWT_REFRESH_TTL` | `720h` | Umur refresh token (harus lebih lama dari access token) |
+| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | kosong | Akun admin (pemilik aplikasi) yang dibuat saat start. Lihat [Akun dan login](12-akun-dan-login.md). |
+| `API_KEYS` | - | **Wajib.** Secret key aplikasi client, dikirim di header `X-API-Key`. Boleh lebih dari satu dipisah koma (satu per aplikasi, atau key lama + baru saat ganti key). Minimal 32 karakter (`openssl rand -hex 32`). Server tidak start bila kosong. |
+
 ## Database (wajib)
 
 | Variabel | Bawaan | Keterangan |
@@ -35,13 +45,14 @@
 | `REDIS_DB` | `0` | |
 | `REDIS_TIMEOUT` | `200ms` | Batas waktu tiap operasi. Pakai `2s` bila Redis jauh, misalnya Redis DEV di VPS dari komputer lokal |
 
-## 9Router (wajib)
+## 9Router
 
 | Variabel | Bawaan | Keterangan |
 |---|---|---|
-| `AI_ROUTER_BASE_URL` | - | Contoh `https://host/v1`. Path `/v1/xyz` diteruskan ke `<BASE_URL>/xyz` |
-| `AI_ROUTER_API_KEY` | - | Key milik middleware, hanya untuk panggilannya sendiri (pemilih cadangan, eval, ekstraksi). Request client memakai key client. |
-| `AI_ROUTER_MODEL` | - | Model bawaan untuk eval bila `EVAL_*_MODEL` kosong |
+| `ROUTER_ALLOW_PRIVATE_NETWORK` | `false` | Izinkan alamat 9Router (`X-Router-URL`) di jaringan internal: localhost, 10.x, 172.16-31.x, 192.168.x, 100.64.x, link-local. Biarkan `false` di server supaya alamat kiriman client tidak bisa menembus Redis/PostgreSQL/metadata cloud; `true` hanya untuk pengembangan lokal. |
+
+Alamat, key, dan model 9Router **tidak** diatur di `.env`. Setiap user mengirim alamatnya di header `X-Router-URL`, key-nya di header `X-Router-Key` dan model di field `model`; pemilih cadangan, ekstraksi memori, dan eval memakai model yang sama, dan model gambar diambil otomatis dari akun user.
+
 
 ## Pemilihan skill
 
@@ -50,7 +61,7 @@
 | `SKILL_MIN_SCORE` | `2.0` | Threshold skor BM25 |
 | `SKILL_SWITCH_RATIO` | `1.5` | Skill aktif diganti bila skill lain skornya ≥ rasio ini × skor skill aktif |
 | `SKILL_AMBIGUOUS_RATIO` | `0.8` | Skill lain dianggap bersaing bila skornya ≥ rasio ini × skor teratas |
-| `SKILL_FALLBACK_MODEL` | kosong | Model pemilih cadangan; kosong = dimatikan |
+| `SKILL_FALLBACK_ENABLED` | `true` | Pemilih cadangan saat skor ambigu. Memakai model dan key chat user. `false` = dimatikan |
 | `SKILL_FALLBACK_TIMEOUT` | `5s` | |
 | `SKILL_BUDGET_DEFAULT` | `3000` | Budget token skill (0 = tanpa batas) |
 | `SKILL_BUDGETS` | kosong | `pola=token,...`, contoh `*mini*=800,*flash*=800` |
@@ -63,8 +74,8 @@
 | Variabel | Bawaan | Keterangan |
 |---|---|---|
 | `EMBEDDING_MODEL` | kosong | Kosong = embedding mati, seleksi memakai BM25 |
-| `EMBEDDING_BASE_URL` | `AI_ROUTER_BASE_URL` | Contoh Ollama: `http://localhost:11434/v1` |
-| `EMBEDDING_API_KEY` | `AI_ROUTER_API_KEY` | |
+| `EMBEDDING_BASE_URL` | - | Wajib bila `EMBEDDING_MODEL` diisi. Contoh Ollama: `http://localhost:11434/v1` |
+| `EMBEDDING_API_KEY` | kosong | Key layanan embedding (bila butuh) |
 | `EMBEDDING_TIMEOUT` | `2s` | Batas embedding pesan per request |
 | `SKILL_MIN_SIMILARITY` | `0.5` | Threshold kemiripan (-1..1) |
 | `SKILL_SWITCH_MARGIN` | `0.05` | Selisih kemiripan untuk mengganti skill aktif |
@@ -74,8 +85,6 @@
 
 | Variabel | Bawaan | Keterangan |
 |---|---|---|
-| `EVAL_TARGET_MODEL` | `AI_ROUTER_MODEL` | Model yang diuji |
-| `EVAL_JUDGE_MODEL` | `AI_ROUTER_MODEL` | Model hakim |
 | `EVAL_CONCURRENCY` | `3` | Soal yang diproses bersamaan |
 
 ## Memori
@@ -88,7 +97,7 @@
 | `MEMORY_MIN_MATCH` | `2` | Kata pesan minimal yang harus ada di catatan |
 | `MEMORY_LOOKUP_TIMEOUT` | `300ms` | Batas waktu pencarian catatan |
 | `MEMORY_NOTE_TTL` | `2160h` (90 hari) | Masa berlaku sejak dikonfirmasi (0 = selamanya) |
-| `MEMORY_EXTRACT_MODEL` | kosong | Model pengekstrak; kosong = ekstraksi mati |
+| `MEMORY_EXTRACT_ENABLED` | `true` | Ekstraksi catatan otomatis memakai model dan key chat user. `false` = mati |
 | `MEMORY_EXTRACT_TIMEOUT` | `60s` | Batas waktu satu ekstraksi |
 | `MEMORY_EXTRACT_CONCURRENCY` | `2` | Ekstraksi yang boleh berjalan bersamaan |
 
@@ -106,6 +115,14 @@
 | `MCP_REFRESH_INTERVAL` | `30m` | Pengambilan ulang daftar tool (0 = hanya saat start dan login) |
 
 `BASE_URL` juga dipakai MCP sebagai alamat balik login OAuth, jadi harus bisa dibuka dari browser.
+
+## Gambar lewat chat
+
+| Variabel | Bawaan | Keterangan |
+|---|---|---|
+| `IMAGE_SIZE` | `1024x1024` | Ukuran gambar |
+| `IMAGE_TIMEOUT` | `2m` | Batas waktu membuat satu gambar |
+| `IMAGE_PATH` | `images` | Folder penyimpanan (dibuat otomatis; di Docker `/app/images`) |
 
 ## Docker (hanya dipakai `docker-compose.yml`)
 

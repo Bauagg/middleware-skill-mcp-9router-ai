@@ -19,6 +19,9 @@ logs/*.log
 # kebetulan bernama sama.
 /skills/
 
+# Gambar hasil generate lewat chat (dibuat otomatis)
+/images/
+
 # Go workspace / vendor
 vendor/
 go.work

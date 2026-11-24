@@ -87,9 +87,9 @@ func queryKey(query string) string {
 // ConversationKey membentuk pengenal percakapan. Format OpenAI tidak punya ID
 // percakapan, jadi dipakai ID dari client bila ada (header X-Conversation-Id),
 // atau pesan user pertama (yang selalu ikut terkirim di setiap request pada
-// percakapan yang sama). Header Authorization ikut di-hash supaya percakapan
-// dua pengguna berbeda tidak bertabrakan; hanya hash-nya yang tersimpan, bukan
-// isinya. "" bila tidak ada bahan sama sekali.
+// percakapan yang sama). user_id ikut di-hash supaya percakapan dua user
+// berbeda tidak bertabrakan; hanya hash-nya yang tersimpan, bukan isinya.
+// "" bila tidak ada bahan sama sekali.
 func ConversationKey(authorization, conversationID, firstUserText string) string {
 	seed := strings.TrimSpace(conversationID)
 	if seed == "" {

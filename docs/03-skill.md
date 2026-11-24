@@ -75,6 +75,25 @@ curl -X POST http://localhost:4000/api/skills/upload -F "file=@founder-pricing.z
 - Aman dari zip slip, symlink, dan zip bomb. Pemasangannya atomik: diekstrak ke folder sementara dulu, baru dipindah. Bila gagal, skill lama dipulihkan.
 - `overwrite=true` untuk mengganti skill yang sudah ada.
 
+### Lewat chat: ambil dari GitHub
+
+Cukup tulis di chat, misalnya: *"ambil skill dari https://github.com/Jakeschincariol/founder-skill.git lalu jadikan zip"*. Model memanggil tool bawaan **`import_skills_from_github`**, yang hanya ditawarkan bila pesan berisi link `github.com`:
+
+1. Middleware mengunduh arsip repo publik. Link `.../tree/<cabang>/<folder>` juga didukung untuk mengambil subfolder saja.
+2. Setiap folder yang berisi `SKILL.md`, di kedalaman berapa pun, disusun ulang menjadi zip skill yang rapi (`<nama>/SKILL.md`). Folder skill di dalam folder skill lain dianggap bagian dari skill luarnya.
+3. Zip itu dipasang lewat proses upload yang sama: hanya file teks, script dibuang, dengan pengamanan zip yang sama.
+4. Jawaban chat berisi daftar skill yang terpasang, file yang dibuang, dan link **Download zip** (`/api/skills/export?names=...`).
+
+Bila skill dengan nama sama sudah ada, skill **tidak ditimpa diam-diam**. Model bertanya dulu, dan baru menimpa (`overwrite=true`) setelah user setuju.
+
+Hasil uji dengan repo founder-skill: 11 skill terpasang dalam sekitar 19 detik, 4 script Python dibuang, dan zip bisa diunduh.
+
+Saat ini **semua user chat boleh memasang skill** (belum ada login). Nanti diamankan lewat API key di sisi aplikasi.
+
+### Download zip skill yang terpasang
+
+`GET /api/skills/export?names=a,b` mengembalikan zip berisi folder skill yang terpasang. Tanpa `names`, semua skill ikut. File cache seperti `.embedding.json` tidak ikut.
+
 Skill juga boleh disalin langsung ke `skills/` tanpa upload. Watcher akan membacanya dalam beberapa detik.
 
 ## Reload otomatis

@@ -65,11 +65,17 @@ func (r *Repository) LoadConfig(path string) (cfg *FileConfig, found bool, err e
 	return cfg, true, nil
 }
 
-// GetCredential mengambil kredensial server (nil bila belum ada).
-func (r *Repository) GetCredential(ctx context.Context, server string) (*Credential, error) {
+// Migrate membuang index unik lama (satu kredensial per server, dari sebelum
+// login per user) yang menghalangi kredensial per (user, server).
+func (r *Repository) Migrate() error {
+	return r.db.Exec(`DROP INDEX IF EXISTS idx_m_mcp_credentials_server`).Error
+}
+
+// GetCredential mengambil kredensial user untuk satu server (nil bila belum ada).
+func (r *Repository) GetCredential(ctx context.Context, userID, server string) (*Credential, error) {
 	// Find + Limit (bukan First) supaya "belum ada" tidak dicatat GORM sebagai error
 	var rows []Credential
-	if err := r.db.WithContext(ctx).Where("server = ?", server).Limit(1).Find(&rows).Error; err != nil {
+	if err := r.db.WithContext(ctx).Where("user_id = ? AND server = ?", userID, server).Limit(1).Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
@@ -78,19 +84,59 @@ func (r *Repository) GetCredential(ctx context.Context, server string) (*Credent
 	return &rows[0], nil
 }
 
-// SaveCredential menyimpan (insert atau update menurut server) kredensial.
+// SaveCredential menyimpan (insert atau update menurut user + server) kredensial.
 func (r *Repository) SaveCredential(ctx context.Context, c *Credential) error {
 	return r.db.WithContext(ctx).
-		Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "server"}}, UpdateAll: true}).
+		Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "user_id"}, {Name: "server"}}, UpdateAll: true}).
 		Create(c).Error
 }
 
-// ClearTokens menghapus token login server (pendaftaran klien tetap disimpan
+// ClearTokens menghapus token login user (pendaftaran klien tetap disimpan
 // supaya login berikutnya tidak perlu mendaftar ulang).
-func (r *Repository) ClearTokens(ctx context.Context, server string) error {
-	return r.db.WithContext(ctx).Model(&Credential{}).Where("server = ?", server).Updates(map[string]any{
+func (r *Repository) ClearTokens(ctx context.Context, userID, server string) error {
+	return r.db.WithContext(ctx).Model(&Credential{}).Where("user_id = ? AND server = ?", userID, server).Updates(map[string]any{
 		"access_token_enc": "", "refresh_token_enc": "", "token_type": "", "expires_at": nil, "connected_at": nil,
 	}).Error
+}
+
+// DeleteCredential menghapus kredensial user untuk satu server.
+func (r *Repository) DeleteCredential(ctx context.Context, userID, server string) error {
+	return r.db.WithContext(ctx).Where("user_id = ? AND server = ?", userID, server).Delete(&Credential{}).Error
+}
+
+// ListUserServers mengambil server MCP milik user, terurut menurut nama.
+func (r *Repository) ListUserServers(ctx context.Context, userID string) ([]UserServer, error) {
+	var rows []UserServer
+	err := r.db.WithContext(ctx).Where("user_id = ?", userID).Order("name").Find(&rows).Error
+	return rows, err
+}
+
+// AllUserServers mengambil server MCP tambahan milik semua user (untuk admin).
+func (r *Repository) AllUserServers(ctx context.Context) ([]UserServer, error) {
+	var rows []UserServer
+	err := r.db.WithContext(ctx).Order("user_id, name").Find(&rows).Error
+	return rows, err
+}
+
+// AllConnections mengambil status login semua user ke semua server (untuk
+// admin). Hanya kolom ringkas yang dibaca: secret dan token tidak ikut.
+func (r *Repository) AllConnections(ctx context.Context) ([]Connection, error) {
+	var rows []Connection
+	err := r.db.WithContext(ctx).Model(&Credential{}).
+		Select("user_id, server, access_token_enc <> '' AS logged_in, expires_at, connected_at").
+		Order("user_id, server").Scan(&rows).Error
+	return rows, err
+}
+
+// CreateUserServer menyimpan server MCP milik user.
+func (r *Repository) CreateUserServer(ctx context.Context, row *UserServer) error {
+	return r.db.WithContext(ctx).Create(row).Error
+}
+
+// DeleteUserServer menghapus server MCP milik user.
+func (r *Repository) DeleteUserServer(ctx context.Context, userID, name string) (int64, error) {
+	res := r.db.WithContext(ctx).Where("user_id = ? AND name = ?", userID, name).Delete(&UserServer{})
+	return res.RowsAffected, res.Error
 }
 
 // SaveState menyimpan state login OAuth selama 10 menit.

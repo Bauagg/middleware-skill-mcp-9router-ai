@@ -7,11 +7,14 @@ import (
 )
 
 // ContextPack adalah satu baris tabel m_context_packs: ringkasan tetap yang
-// selalu relevan (gambaran bisnis, istilah, aturan tetap). Semua context pack
-// yang aktif disisipkan ke prompt setelah skill.
+// selalu relevan untuk satu user (gambaran bisnis, istilah, aturan tetap).
+// Semua context pack aktif milik user disisipkan ke prompt setelah skill.
 type ContextPack struct {
-	ID      string `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	Name    string `json:"name" gorm:"size:100;not null;uniqueIndex:idx_m_context_packs_name,where:deleted_at IS NULL"`
+	ID string `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+
+	// UserID pemilik (header X-User-Id). Nama unik per user.
+	UserID  string `json:"user_id" gorm:"size:128;not null;default:'';uniqueIndex:idx_m_context_packs_user_name,priority:1,where:deleted_at IS NULL"`
+	Name    string `json:"name" gorm:"size:100;not null;uniqueIndex:idx_m_context_packs_user_name,priority:2,where:deleted_at IS NULL"`
 	Content string `json:"content" gorm:"type:text;not null"`
 	// Active false = disimpan tapi tidak disisipkan ke prompt.
 	Active bool `json:"active" gorm:"not null"`

@@ -16,9 +16,21 @@ Client ──chat──▶ middleware ──(chat + daftar tool)──▶ 9Route
 
 Model di 9Router mendukung tool calling (sudah diuji dengan `AI-Crypro`), jadi model bisa meminta "panggil tool X". Yang menjalankan tool-nya adalah middleware.
 
-## Daftar server: `mcp.json`
+## MCP per user
 
-Server MCP didaftarkan di file `mcp.json` (lokasi diatur `MCP_CONFIG_PATH`). File ini **tidak berisi rahasia** dan boleh di-commit. Perubahan berlaku setelah server di-restart.
+Setiap user (header `X-User-Id`) punya koneksi MCP **sendiri**:
+
+| | Berlaku untuk | Disimpan di |
+|---|---|---|
+| **Server bawaan** (mis. Canva) | semua user (masing-masing tetap login ke akunnya sendiri) | `mcp.json` (diatur admin, butuh restart) |
+| **Server tambahan** (mis. Notion yang ditambah lewat chat) | hanya user yang menambahkannya | tabel `m_mcp_servers` (langsung aktif) |
+| **Login / token** | per (user, server) | tabel `m_mcp_credentials`, terenkripsi `MCP_TOKEN_KEY` |
+
+Koneksi dan daftar tool dibuat per (user, server) saat pertama dipakai. Koneksi yang tidak dipakai selama 1 jam ditutup otomatis. Tool server milik user A **tidak pernah** ditawarkan atau dijalankan di chat user B.
+
+## Server bawaan: `mcp.json`
+
+Server bawaan didaftarkan di file `mcp.json` (lokasi diatur `MCP_CONFIG_PATH`). File ini **tidak berisi rahasia** dan boleh di-commit. Perubahan berlaku setelah server di-restart. Di Docker file ini dipasang read-only.
 
 ```json
 {
@@ -45,28 +57,22 @@ Server MCP didaftarkan di file `mcp.json` (lokasi diatur `MCP_CONFIG_PATH`). Fil
 | `url` | ya | Endpoint MCP **Streamable HTTP**. |
 | `enabled` | tidak | `false` = dilewati. Bawaan `true`. |
 | `keywords` | tidak | Kata yang ikut dicocokkan dengan pesan user saat memilih tool, seperti `keywords` skill. |
-| `headers` | tidak | Header untuk server yang memakai API key, bukan OAuth. `${NAMA_ENV}` diganti isi `.env`, supaya rahasianya tidak tertulis di `mcp.json`. |
+| `headers` | tidak | Header untuk server yang memakai API key, bukan OAuth. `${NAMA_ENV}` diganti isi `.env`. Server dengan `headers` memakai key yang sama untuk semua user. |
 
-Yang didukung hanya server MCP **jarak jauh (HTTP)**. Server MCP lokal yang dijalankan sebagai proses (`npx ...`, stdio) tidak didukung langsung. Jalankan server seperti itu sebagai layanan HTTP terpisah, lalu daftarkan URL-nya.
+Yang didukung hanya server MCP **jarak jauh (HTTP)**. Server MCP lokal (`npx ...`, stdio) dijalankan sebagai layanan HTTP terpisah, lalu didaftarkan URL-nya.
 
-## Login (OAuth): satu akun bersama
+## Login (OAuth) ke akun masing-masing
 
-Server seperti Canva memakai login OAuth. Login dilakukan **sekali per server** dan dipakai semua chat, karena memori middleware memang global (tidak terikat user).
+1. User meminta lewat chat ("konekan saya ke canva"). Chat memberi **link login khusus user itu**, atau aplikasi client mengambilnya dari `connect_url` di `GET /api/mcp/servers`.
+2. Link berbentuk `BASE_URL/api/mcp/servers/canva/connect?u=<user_id>&exp=...&sig=...`. Browser tidak bisa mengirim header `X-User-Id`, jadi `user_id` ikut di link dan **ditandatangani (HMAC)** dengan kunci turunan `MCP_TOKEN_KEY`. Link yang diubah ke user lain atau sudah lewat 24 jam ditolak. Aplikasi client juga boleh memanggil `/connect?redirect=false` dengan header `X-User-Id`.
+3. Middleware otomatis mencari alamat login (RFC 9728/8414), mendaftarkan dirinya sebagai aplikasi OAuth bila perlu (DCR), lalu mengarahkan browser ke halaman login dengan PKCE.
+4. User login dengan **akunnya sendiri** dan menyetujui akses. Browser kembali ke `/api/mcp/oauth/callback` (user dibawa di state login) dan menampilkan "Login berhasil".
 
-1. Buka di browser: `http://<BASE_URL>/api/mcp/servers/canva/connect`
-2. Middleware otomatis:
-   - mencari alamat login server (discovery, RFC 9728 dan RFC 8414);
-   - mendaftarkan dirinya sebagai aplikasi OAuth (Dynamic Client Registration), sekali saja;
-   - mengarahkan browser ke halaman login Canva, dengan PKCE.
-3. Login dan setujui akses di halaman Canva.
-4. Browser kembali ke `/api/mcp/oauth/callback` dan menampilkan "Login berhasil: N tool tersedia".
-
-Token disimpan di tabel `m_mcp_credentials`, **terenkripsi** dengan `MCP_TOKEN_KEY`, lalu diperpanjang otomatis memakai refresh token. Bila perpanjangan gagal (misalnya akses dicabut), server berstatus `needs_login` dan cukup login ulang lewat `/connect`.
+Token disimpan per (user, server), terenkripsi, dan diperpanjang otomatis. Bila perpanjangan gagal, server berstatus `needs_login` untuk user itu saja, dan cukup login ulang.
 
 Penting:
-- `BASE_URL` harus alamat yang bisa dibuka **browser** kamu, karena halaman login mengarahkan balik ke `BASE_URL/api/mcp/oauth/callback`. Di lokal: `http://localhost:4000`. Di VPS: alamat publik lewat NGINX. Bila `BASE_URL` berubah, middleware mendaftar ulang otomatis saat `/connect` berikutnya.
-- **Jangan mengganti `MCP_TOKEN_KEY`** setelah login. Token lama tidak bisa dibaca lagi dan semua server harus login ulang.
-- Karena `/api/*` tanpa autentikasi, siapa pun yang bisa membuka `/connect` bisa menyambungkan akunnya sendiri. Batasi `/api/*` di NGINX (lihat [deploy](09-menjalankan-dan-deploy.md)).
+- `BASE_URL` harus alamat yang bisa dibuka **browser** user, karena halaman login mengarahkan balik ke `BASE_URL/api/mcp/oauth/callback`.
+- **Jangan mengganti `MCP_TOKEN_KEY`** setelah ada user yang login: token lama tidak bisa dibaca lagi dan link login lama tidak berlaku.
 
 ### Figma belum bisa dipakai lewat server resminya
 
@@ -75,6 +81,23 @@ Server MCP resmi Figma (`mcp.figma.com/mcp`) **menolak pendaftaran otomatis** de
 Jalan keluar yang mungkin:
 - jalankan server MCP Figma pihak ketiga yang memakai **personal access token** Figma (misalnya Framelink / `figma-developer-mcp` dalam mode HTTP) sebagai container terpisah, lalu daftarkan URL-nya di `mcp.json`;
 - atau ajukan aplikasi ke Figma supaya didaftarkan sebagai klien yang disetujui.
+
+## Kelola MCP lewat chat
+
+Bila pesan mengandung kata seperti konek, connect, sambung, hubung, login, integrasi, atau mcp, model mendapat empat tool bawaan. Semuanya bekerja untuk **user yang sedang chat**:
+
+| Tool | Contoh pesan | Yang terjadi |
+|---|---|---|
+| `list_connections` | "mcp apa aja yang udah tersambung?" | Status server bawaan + server milik user (connected, needs_login, disabled, error) |
+| `connect_service` | "tolong konekan saya ke canva" | Link login khusus user itu (berlaku 24 jam), atau info "sudah tersambung" |
+| `add_mcp_server` | "tambahkan MCP notion, url-nya https://mcp.notion.com/mcp" | URL dicek dulu (harus `https` dan benar-benar server MCP), lalu disimpan sebagai **server milik user itu** dan langsung aktif. Bila butuh login, chat memberi link login. |
+| `remove_mcp_server` | "hapus MCP notion" | Model meminta konfirmasi dulu, lalu server milik user dihapus beserta login-nya. Server bawaan tidak bisa dihapus lewat chat. |
+
+Catatan:
+- URL yang bukan server MCP ditolak.
+- Server yang memakai **API key** ditambahkan admin di `mcp.json` (`headers`), karena chat tidak boleh menerima token atau password.
+- Saat ini semua user chat boleh menambah server miliknya sendiri. Nanti diamankan lewat API key chat di aplikasi.
+- Hal yang sama tersedia lewat API: `POST /api/mcp/servers` dan `DELETE /api/mcp/servers/:name` (dengan header `X-User-Id`).
 
 ## Memilih tool yang dikirim ke model
 
@@ -128,7 +151,7 @@ Artinya, setiap pemakaian tool kira-kira **menggandakan biaya dan waktu** diband
 
 ## Status server
 
-`GET /api/mcp/servers`:
+`GET /api/mcp/servers` (header `X-User-Id`) menampilkan server bawaan dan server milik user (`own: true`), dengan status koneksi user itu:
 
 | `state` | Arti | Tindakan |
 |---|---|---|

@@ -2,22 +2,30 @@ package skillstore
 
 import (
 	"archive/zip"
+	"bytes"
 	"compress/flate"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
+	"unicode"
 
 	"go.uber.org/zap"
+	"gopkg.in/yaml.v3"
 
 	"github.com/Bauagg/middleware-skill-ai/internal/logger"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/apperror"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/frontmatter"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/llmtool"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/response"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/skillclean"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/tokens"
@@ -559,4 +567,505 @@ func zipReadErr(op string, err error) error {
 		return apperror.NewBadRequest("File zip rusak", fieldErr("file", "isi zip tidak bisa dibaca"))
 	}
 	return internalErr(op, err)
+}
+
+// ---------------------------------------------------------------------------
+// impor skill dari GitHub lewat chat (tool import_skills_from_github)
+// ---------------------------------------------------------------------------
+
+// ImportToolName adalah nama tool yang dilihat model.
+const ImportToolName = "import_skills_from_github"
+
+var (
+	githubURLRe  = regexp.MustCompile(`(?i)github\.com/[\w.-]+/[\w.-]+`)
+	githubPartRe = regexp.MustCompile(`^[\w.-]+$`)
+)
+
+// RepoDownloader mengunduh arsip repo; clients.GitHub memenuhinya.
+type RepoDownloader interface {
+	DownloadZip(ctx context.Context, owner, repo, ref string) ([]byte, error)
+}
+
+// ImportTool membuat model bisa memasang skill dari repo GitHub: repo
+// diunduh, setiap folder yang berisi SKILL.md (di kedalaman berapa pun)
+// disusun ulang menjadi zip skill yang rapi (<nama>/SKILL.md), lalu dipasang
+// lewat Upload (aturan dan pengamanan yang sama dengan upload zip). User juga
+// mendapat link download zip skill yang terpasang.
+type ImportTool struct {
+	svc     *Service
+	gh      RepoDownloader
+	baseURL string
+	spec    json.RawMessage
+}
+
+// NewImportTool membuat tool impor skill.
+func NewImportTool(svc *Service, gh RepoDownloader, baseURL string) *ImportTool {
+	return &ImportTool{svc: svc, gh: gh, baseURL: strings.TrimRight(baseURL, "/"), spec: llmtool.Function(ImportToolName,
+		"Unduh skill dari repo GitHub publik, pasang ke middleware, dan buat zip-nya. Pakai bila user memberi link "+
+			"github.com dan meminta skill diambil/dipasang/dijadikan zip. Setiap folder berisi SKILL.md menjadi satu skill. "+
+			"Bila skill dengan nama sama sudah ada, tanyakan dulu ke user sebelum memanggil lagi dengan overwrite=true.",
+		map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"url":       map[string]any{"type": "string", "description": "link repo GitHub, mis. https://github.com/owner/repo atau .../tree/main/skills"},
+				"overwrite": map[string]any{"type": "boolean", "description": "true = ganti skill yang sudah ada dengan nama sama"},
+			},
+			"required": []string{"url"},
+		})}
+}
+
+// Select menawarkan tool hanya bila pesan user berisi link GitHub.
+func (t *ImportTool) Select(_ context.Context, query string) []llmtool.Spec {
+	if !githubURLRe.MatchString(query) {
+		return nil
+	}
+	return []llmtool.Spec{{Name: ImportToolName, Source: "skills", Definition: t.spec}}
+}
+
+// Has melaporkan apakah tool ini milik impor skill.
+func (t *ImportTool) Has(_ context.Context, name string) bool { return name == ImportToolName }
+
+// Call mengunduh repo, memasang skill-nya, lalu memberi link zip ke model.
+func (t *ImportTool) Call(ctx context.Context, _ string, args string) llmtool.Result {
+	var a struct {
+		URL       string `json:"url"`
+		Overwrite bool   `json:"overwrite"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(args)), &a); err != nil || strings.TrimSpace(a.URL) == "" {
+		return llmtool.Result{Text: `argumen tidak valid: kirim {"url": "https://github.com/owner/repo"}`, IsError: true}
+	}
+	owner, repo, ref, sub, err := parseGitHubURL(a.URL)
+	if err != nil {
+		return llmtool.Result{Text: err.Error(), IsError: true}
+	}
+
+	dlCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	archive, err := t.gh.DownloadZip(dlCtx, owner, repo, ref)
+	if err != nil {
+		return llmtool.Result{Text: "gagal mengunduh repo: " + err.Error(), IsError: true}
+	}
+
+	skillZip, found, notes, err := buildSkillZip(archive, repo, sub)
+	if err != nil {
+		return llmtool.Result{Text: err.Error(), IsError: true}
+	}
+	zr, err := zip.NewReader(bytes.NewReader(skillZip), int64(len(skillZip)))
+	if err != nil {
+		return llmtool.Result{Text: "zip skill rusak: " + err.Error(), IsError: true}
+	}
+
+	res, err := t.svc.Upload(zr, UploadInput{Overwrite: a.Overwrite})
+	if err != nil {
+		var ae *apperror.AppError
+		if errors.As(err, &ae) {
+			msg := ae.Message
+			for _, fe := range ae.Errors {
+				msg += "; " + fe.Message
+			}
+			if ae.StatusCode == 409 {
+				msg += ". Tanyakan ke user apakah skill yang sudah ada boleh diganti; bila ya, panggil lagi dengan overwrite=true."
+			}
+			return llmtool.Result{Text: "gagal memasang skill: " + msg, IsError: true}
+		}
+		return llmtool.Result{Text: "gagal memasang skill: " + err.Error(), IsError: true}
+	}
+
+	names := make([]string, 0, len(res.Skills))
+	var b strings.Builder
+	fmt.Fprintf(&b, "Berhasil memasang %d skill dari github.com/%s/%s (ditemukan %d folder SKILL.md):\n", len(res.Skills), owner, repo, found)
+	for _, s := range res.Skills {
+		names = append(names, s.Name)
+		status := "baru"
+		if s.Replaced {
+			status = "diganti"
+		}
+		fmt.Fprintf(&b, "- %s (%s, %d file): %s\n", s.Name, status, s.Files, clipText(s.Description, 140))
+	}
+	if n := len(res.SkippedFiles); n > 0 {
+		fmt.Fprintf(&b, "\n%d file tidak dipasang (script/non-teks, mis. %s). Model tidak bisa menjalankan script, "+
+			"jadi skill yang bergantung pada script mungkin tidak bekerja penuh.\n", n, strings.Join(firstN(res.SkippedFiles, 4), ", "))
+	}
+	for _, n := range notes {
+		b.WriteString("\nCatatan: " + n)
+	}
+	zipURL := t.baseURL + "/api/skills/export?names=" + url.QueryEscape(strings.Join(names, ","))
+	b.WriteString("\n\nLink download zip skill yang terpasang: " + zipURL +
+		"\nTampilkan ke user sebagai link markdown [Download zip skill](" + zipURL + "). Skill langsung bisa dipakai di chat berikutnya.")
+	logger.Info("skill diimpor dari github", zap.String("repo", owner+"/"+repo), zap.Strings("skills", names))
+	return llmtool.Result{Text: b.String()}
+}
+
+// parseGitHubURL membaca owner, repo, ref, dan subfolder dari link GitHub:
+// github.com/owner/repo(.git), .../tree/<ref>/<subfolder...>.
+func parseGitHubURL(raw string) (owner, repo, ref, sub string, err error) {
+	raw = strings.TrimSpace(raw)
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	u, perr := url.Parse(raw)
+	if perr != nil || !strings.EqualFold(strings.TrimPrefix(u.Host, "www."), "github.com") {
+		return "", "", "", "", errors.New("link harus repo publik di github.com, mis. https://github.com/owner/repo")
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) < 2 {
+		return "", "", "", "", errors.New("link GitHub harus berisi owner dan nama repo")
+	}
+	owner, repo = parts[0], strings.TrimSuffix(parts[1], ".git")
+	if !githubPartRe.MatchString(owner) || !githubPartRe.MatchString(repo) {
+		return "", "", "", "", errors.New("owner atau nama repo tidak valid")
+	}
+	if len(parts) >= 4 && (parts[2] == "tree" || parts[2] == "blob") {
+		ref = parts[3]
+		sub = strings.Join(parts[4:], "/")
+		if parts[2] == "blob" { // link ke file: pakai foldernya
+			sub = path.Dir(sub)
+		}
+		if sub == "." {
+			sub = ""
+		}
+	}
+	return owner, repo, ref, sub, nil
+}
+
+// buildSkillZip menyusun ulang arsip repo menjadi zip skill: setiap folder
+// yang berisi SKILL.md (di kedalaman berapa pun, di bawah sub bila diisi)
+// menjadi <nama-folder>/... di root zip. Folder skill di dalam folder skill
+// lain dianggap bagian dari skill luarnya. File di luar folder skill dibuang.
+func buildSkillZip(archive []byte, repo, sub string) (out []byte, found int, notes []string, err error) {
+	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		return nil, 0, nil, errors.New("arsip repo rusak: " + err.Error())
+	}
+
+	type file struct {
+		rel string
+		f   *zip.File
+	}
+	var files []file
+	var dirs []string
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		i := strings.Index(f.Name, "/") // buang folder teratas "<repo>-<ref>/"
+		if i < 0 {
+			continue
+		}
+		rel := f.Name[i+1:]
+		if sub != "" && !strings.HasPrefix(rel, strings.Trim(sub, "/")+"/") {
+			continue
+		}
+		files = append(files, file{rel: rel, f: f})
+		if path.Base(rel) == skillFile {
+			dirs = append(dirs, path.Dir(rel))
+		}
+	}
+	if len(dirs) == 0 {
+		where := "repo"
+		if sub != "" {
+			where = "folder " + sub
+		}
+		return nil, 0, nil, fmt.Errorf("tidak ada SKILL.md di %s, jadi tidak ada skill yang bisa dipasang", where)
+	}
+
+	// folder terluar dulu; folder skill di dalam folder skill lain dilewati
+	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) < len(dirs[j]) })
+	var roots []string
+	for _, d := range dirs {
+		nested := false
+		for _, r := range roots {
+			if r == "." || strings.HasPrefix(d, r+"/") {
+				nested = true
+				break
+			}
+		}
+		if !nested {
+			roots = append(roots, d)
+		}
+	}
+
+	nameOf := map[string]string{}
+	used := map[string]bool{}
+	for _, r := range roots {
+		n := path.Base(r)
+		if r == "." {
+			n = repo
+		}
+		if used[n] {
+			notes = append(notes, "folder "+r+" dilewati karena namanya sama dengan skill lain")
+			continue
+		}
+		used[n], nameOf[r] = true, n
+	}
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	var total int64
+	for _, fl := range files {
+		root := ""
+		for r := range nameOf {
+			if (r == "." || strings.HasPrefix(fl.rel, r+"/")) && len(r) >= len(root) {
+				root = r
+			}
+		}
+		if root == "" {
+			continue
+		}
+		inner := fl.rel
+		if root != "." {
+			inner = strings.TrimPrefix(fl.rel, root+"/")
+		}
+		if fl.f.UncompressedSize64 > maxFileBytes {
+			continue // file besar (mis. gambar) tidak dipasang Upload juga
+		}
+		data, err := readAll(fl.f)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if total += int64(len(data)); total > maxTotalBytes {
+			return nil, 0, nil, errors.New("isi skill di repo terlalu besar (maks 20 MB)")
+		}
+		w, err := zw.Create(nameOf[root] + "/" + inner)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if _, err := w.Write(data); err != nil {
+			return nil, 0, nil, err
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return nil, 0, nil, err
+	}
+	if buf.Len() > MaxZipBytes {
+		return nil, 0, nil, errors.New("zip skill melebihi 10 MB")
+	}
+	return buf.Bytes(), len(roots), notes, nil
+}
+
+// Export menyusun zip berisi skill yang terpasang (<nama>/...). names kosong
+// = semua skill. File yang diawali "." (cache embedding) tidak ikut.
+func (s *Service) Export(names []string) ([]byte, error) {
+	if len(names) == 0 {
+		all, err := s.repo.List()
+		if err != nil {
+			return nil, internalErr("list skills", err)
+		}
+		names = all
+	}
+	for _, n := range names {
+		if !nameRe.MatchString(n) || !s.repo.Exists(n) {
+			return nil, apperror.NewNotFound("Skill '" + n + "' tidak ditemukan")
+		}
+	}
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, n := range names {
+		files, err := s.repo.Files(n)
+		if err != nil {
+			return nil, internalErr("list files "+n, err)
+		}
+		for _, f := range files {
+			data, err := s.repo.ReadFile(n, filepath.FromSlash(f))
+			if err != nil {
+				return nil, internalErr("read "+n+"/"+f, err)
+			}
+			w, err := zw.Create(n + "/" + f)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := w.Write(data); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func clipText(s string, n int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= n {
+		return string(r)
+	}
+	return string(r[:n]) + "..."
+}
+
+func firstN(list []string, n int) []string {
+	if len(list) > n {
+		return list[:n]
+	}
+	return list
+}
+
+// ---------------------------------------------------------------------------
+// buat skill lewat chat (tool create_skill)
+// ---------------------------------------------------------------------------
+
+// CreateToolName adalah nama tool yang dilihat model.
+const CreateToolName = "create_skill"
+
+// minSkillRunes mencegah skill kosong/asal-asalan.
+const minSkillRunes = 300
+
+// createVerbs menandai pesan yang meminta membuat atau mencari skill.
+var createVerbs = []string{"buat", "bikin", "create", "tulis", "generate", "rancang", "susun", "cari", "carikan"}
+
+// CreateTool membuat model bisa menulis skill baru sendiri: model menulis isi
+// SKILL.md (dan SHORT.md), middleware menyusun frontmatter yang benar,
+// memasangnya lewat Upload (aturan yang sama dengan upload zip), lalu memberi
+// link download zip.
+type CreateTool struct {
+	svc     *Service
+	baseURL string
+	spec    json.RawMessage
+}
+
+// NewCreateTool membuat tool pembuat skill.
+func NewCreateTool(svc *Service, baseURL string) *CreateTool {
+	return &CreateTool{svc: svc, baseURL: strings.TrimRight(baseURL, "/"), spec: llmtool.Function(CreateToolName,
+		"Buat dan pasang skill baru yang ditulis sendiri (mis. skill meta-ads, copywriting, riset pasar). "+
+			"Pakai bila user meminta dibuatkan skill, atau saat mencari skill tidak menemukan yang cocok dan user setuju dibuatkan. "+
+			"Aturan menulis skill: pakai bahasa user; isi berupa panduan kerja yang bisa langsung dipraktikkan dengan bagian "+
+			"'# Judul', '## Kapan dipakai', '## Langkah kerja', '## Aturan dan hal yang dihindari', '## Contoh'; "+
+			"jangan merujuk script, file lain, atau tool yang tidak ada (model hanya membaca teks); "+
+			"panjang isi sekitar 600-2500 kata. Bila skill dengan nama sama sudah ada, tanyakan dulu sebelum overwrite=true.",
+		map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"name":        map[string]any{"type": "string", "description": "nama skill: huruf kecil, angka, dipisah -, mis. meta-ads"},
+				"description": map[string]any{"type": "string", "description": "satu-dua kalimat KAPAN skill dipakai (dicocokkan dengan pesan user), maks 1024 karakter"},
+				"keywords":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "kata kunci bahasa Indonesia dan Inggris yang sering dipakai user untuk topik ini"},
+				"content":     map[string]any{"type": "string", "description": "isi SKILL.md dalam markdown (tanpa frontmatter)"},
+				"short":       map[string]any{"type": "string", "description": "ringkasan 200-400 token untuk model kecil (isi SHORT.md), opsional"},
+				"overwrite":   map[string]any{"type": "boolean", "description": "true = ganti skill dengan nama sama"},
+			},
+			"required": []string{"name", "description", "content"},
+		})}
+}
+
+// Select menawarkan create_skill bila pesan meminta membuat/mencari skill.
+func (t *CreateTool) Select(_ context.Context, query string) []llmtool.Spec {
+	words := strings.FieldsFunc(strings.ToLower(query), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-'
+	})
+	hasSkill, hasVerb := false, false
+	for _, w := range words {
+		if strings.HasPrefix(w, "skill") || strings.HasPrefix(w, "skil") {
+			hasSkill = true
+		}
+		for _, v := range createVerbs {
+			if strings.HasPrefix(w, v) || strings.HasPrefix(w, "mem"+v) || strings.HasPrefix(w, "di"+v) {
+				hasVerb = true
+			}
+		}
+	}
+	if !hasSkill || !hasVerb {
+		return nil
+	}
+	return []llmtool.Spec{{Name: CreateToolName, Source: "skills", Definition: t.spec}}
+}
+
+// Has melaporkan apakah tool ini milik pembuat skill.
+func (t *CreateTool) Has(_ context.Context, name string) bool { return name == CreateToolName }
+
+// Call menyusun SKILL.md, memasangnya, lalu memberi link zip.
+func (t *CreateTool) Call(ctx context.Context, _ string, args string) llmtool.Result {
+	var a struct {
+		Name        string   `json:"name"`
+		Description string   `json:"description"`
+		Keywords    []string `json:"keywords"`
+		Content     string   `json:"content"`
+		Short       string   `json:"short"`
+		Overwrite   bool     `json:"overwrite"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(args)), &a); err != nil {
+		return llmtool.Result{Text: "argumen tidak valid: " + err.Error(), IsError: true}
+	}
+	a.Name = strings.ToLower(strings.TrimSpace(a.Name))
+	a.Description = strings.Join(strings.Fields(a.Description), " ")
+	a.Content = strings.TrimSpace(a.Content)
+	switch {
+	case !nameRe.MatchString(a.Name) || len(a.Name) > maxNameLen:
+		return llmtool.Result{Text: "nama skill harus huruf kecil/angka dipisah - atau _ (maks 64), mis. meta-ads", IsError: true}
+	case a.Description == "" || len([]rune(a.Description)) > maxDescLen:
+		return llmtool.Result{Text: "description wajib diisi (maks 1024 karakter) dan menjelaskan kapan skill dipakai", IsError: true}
+	case len([]rune(a.Content)) < minSkillRunes:
+		return llmtool.Result{Text: "isi skill terlalu pendek; tulis panduan kerja yang lengkap (langkah, aturan, contoh)", IsError: true}
+	case len(a.Content) > maxFileBytes:
+		return llmtool.Result{Text: "isi skill terlalu panjang (maks 2 MB)", IsError: true}
+	}
+	if strings.HasPrefix(a.Content, "---") { // model kadang ikut menulis frontmatter: dibuang, diganti yang benar
+		if i := strings.Index(a.Content[3:], "\n---"); i >= 0 {
+			a.Content = strings.TrimSpace(a.Content[3+i+4:])
+		}
+	}
+
+	var keywords []string
+	for _, k := range a.Keywords {
+		if k = strings.TrimSpace(k); k != "" {
+			keywords = append(keywords, k)
+		}
+	}
+	fm, err := yaml.Marshal(struct {
+		Name        string   `yaml:"name"`
+		Description string   `yaml:"description"`
+		Keywords    []string `yaml:"keywords,omitempty"`
+	}{a.Name, a.Description, keywords})
+	if err != nil {
+		return llmtool.Result{Text: "gagal menyusun frontmatter: " + err.Error(), IsError: true}
+	}
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	files := map[string]string{a.Name + "/" + skillFile: "---\n" + string(fm) + "---\n\n" + a.Content + "\n"}
+	if s := strings.TrimSpace(a.Short); s != "" {
+		files[a.Name+"/"+shortFile] = s + "\n"
+	}
+	for name, body := range files {
+		w, err := zw.Create(name)
+		if err == nil {
+			_, err = w.Write([]byte(body))
+		}
+		if err != nil {
+			return llmtool.Result{Text: "gagal menyusun zip skill: " + err.Error(), IsError: true}
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return llmtool.Result{Text: "gagal menyusun zip skill: " + err.Error(), IsError: true}
+	}
+
+	zr, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		return llmtool.Result{Text: "zip skill rusak: " + err.Error(), IsError: true}
+	}
+	res, err := t.svc.Upload(zr, UploadInput{Overwrite: a.Overwrite})
+	if err != nil {
+		var ae *apperror.AppError
+		if errors.As(err, &ae) {
+			msg := ae.Message
+			for _, fe := range ae.Errors {
+				msg += "; " + fe.Message
+			}
+			if ae.StatusCode == 409 {
+				msg += ". Tanyakan ke user apakah skill lama boleh diganti; bila ya, panggil lagi dengan overwrite=true."
+			}
+			return llmtool.Result{Text: "gagal memasang skill: " + msg, IsError: true}
+		}
+		return llmtool.Result{Text: "gagal memasang skill: " + err.Error(), IsError: true}
+	}
+
+	zipURL := t.baseURL + "/api/skills/export?names=" + url.QueryEscape(a.Name)
+	status := "baru"
+	if len(res.Skills) > 0 && res.Skills[0].Replaced {
+		status = "menggantikan versi lama"
+	}
+	logger.Info("skill dibuat lewat chat", zap.String("skill", a.Name), zap.Int("chars", len(a.Content)))
+	return llmtool.Result{Text: fmt.Sprintf("Skill %s berhasil dibuat dan dipasang (%s, %d karakter, SHORT.md: %v). "+
+		"Skill langsung dipakai otomatis di chat berikutnya bila pesannya cocok.\nLink download zip: %s\n"+
+		"Tampilkan ke user sebagai link markdown [Download zip skill %s](%s), lalu ringkas isi skill-nya dalam beberapa poin.",
+		a.Name, status, len([]rune(a.Content)), a.Short != "", zipURL, a.Name, zipURL)}
 }

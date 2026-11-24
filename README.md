@@ -13,6 +13,10 @@ diportalkan ke gaya idiomatik Go.
 
 > **Dokumentasi lengkap** (cara kerja, struktur kode, skill, memori, API, konfigurasi, deploy, dan solusi error umum) ada di folder [`docs/`](docs/README.md).
 
+> **Secret key:** setiap request wajib membawa header **`X-API-Key`** (nilai dari `API_KEYS` di `.env`), kecuali `/health`, `/images/...`, dan alur login MCP yang dibuka browser. User tanpa aplikasi pihak ketiga bisa register/login di `/api/auth/*` dan memakai `Authorization: Bearer <access_token>` sebagai pengganti `X-API-Key` + `X-User-Id`; admin (dari `ADMIN_EMAIL`) melihat data semua user, user biasa hanya miliknya, skill tetap global ([docs/12](docs/12-akun-dan-login.md)). Request `/v1/*` juga wajib membawa **`X-Router-URL`** (alamat 9Router milik user) dan **`X-Router-Key`** (key 9Router milik user), dan chat wajib mengirim `model`.
+>
+> **Identitas user:** semua request chat dan API data wajib membawa header **`X-User-Id`** dari aplikasi client. Log, eval, context pack, catatan memori, gambar, dan koneksi MCP disimpan per user. Skill berlaku untuk semua user. Lihat [`docs/07-api.md`](docs/07-api.md).
+
 ## Tech Stack
 
 | Kebutuhan | Pustaka |
@@ -45,6 +49,7 @@ middleware-skill-ai/
 │   │   ├── eval/                 # eval skill: EVAL.yaml -> jawaban model -> skor hakim -> t_eval_runs
 │   │   ├── contextpack/          # context pack (m_context_packs): ringkasan tetap yang selalu disisipkan
 │   │   ├── memorynote/           # catatan memori (t_memory_notes): ekstraksi, konfirmasi, pencarian teks
+│   │   ├── imagegen/             # tool generate_image: buat gambar lewat chat, simpan di images/ + t_generated_images
 │   │   ├── mcp/                  # koneksi MCP (Canva, ...): mcp.json, login OAuth (m_mcp_credentials), pilih & jalankan tool
 │   │   └── usagelog/             # log pemakaian di PostgreSQL (t_usage_logs) + GET /api/usage-logs
 │   ├── clients/                  # klien layanan pihak ketiga, satu file per layanan
@@ -52,7 +57,8 @@ middleware-skill-ai/
 │   │   ├── redis.go              # koneksi Redis (timeout pendek, gagal = cache miss)
 │   │   ├── embedding.go          # klien embedding umum (POST /embeddings: 9Router, Ollama, dll.)
 │   │   ├── mcp.go                # klien server MCP (Streamable HTTP, SDK resmi go-sdk): daftar & panggil tool
-│   │   └── mcpauth.go            # discovery OAuth server MCP + pendaftaran klien otomatis (DCR)
+│   │   ├── mcpauth.go            # discovery OAuth server MCP + pendaftaran klien otomatis (DCR)
+│   │   └── images.go             # klien pembuat gambar berformat OpenAI (POST /images/generations)
 │   └── pkg/                      # pustaka bersama, tidak tahu soal domain
 │       ├── response/             # Amplop {status,message,data,errors}
 │       ├── apperror/             # AppError + Handle + BindingErrors
@@ -64,7 +70,8 @@ middleware-skill-ai/
 │       ├── modelbudget/          # budget token per model (pola nama model -> token)
 │       ├── uuidparam/            # validasi parameter path :id berformat UUID (400 bila bukan)
 │       ├── vector/               # kemiripan kosinus untuk seleksi embedding
-│       └── secretbox/            # enkripsi AES-256-GCM untuk token login MCP di database
+│       ├── secretbox/            # enkripsi AES-256-GCM untuk token login MCP di database
+│       └── llmtool/              # bentuk tool untuk model + hasilnya (dipakai MCP, pembuat gambar, proxy)
 ├── docker/redis-dev/             # Redis DEV (docker compose) untuk dijalankan di VPS, port 6380
 ├── docs/                         # dokumentasi lengkap (mulai dari docs/README.md)
 ├── Dockerfile                    # image middleware (build 2 tahap, user non-root, healthcheck)
@@ -81,7 +88,7 @@ middleware-skill-ai/
 ```bash
 # 1. Siapkan env
 copy .env.example .env      # Linux/macOS: cp .env.example .env
-#    isi DB_* (PostgreSQL), REDIS_ADDR (Redis), AI_ROUTER_BASE_URL dan AI_ROUTER_API_KEY (9Router); semuanya wajib
+#    isi DB_* (PostgreSQL), REDIS_ADDR (Redis), API_KEYS, JWT_SECRET; semuanya wajib. Alamat, key, dan model 9Router dikirim tiap user, bukan di .env
 
 # 2. Unduh dependensi
 go mod tidy
@@ -132,6 +139,7 @@ Bila port 6380 tidak bisa dijangkau setelah container jalan, buka port itu di fi
 | GET | `/api/ping` | `{ message: pong }` |
 | GET | `/api/skills` | Daftar skill yang terpasang |
 | POST | `/api/skills/upload` | Upload skill dalam bentuk zip |
+| GET | `/api/skills/export?names=a,b` | Download zip skill yang terpasang (tanpa `names` = semua) |
 | GET | `/api/skills/match?q=...&limit=5&fallback=false` | Skill apa yang akan terpilih untuk sebuah pesan, skor kandidat, dan apakah skornya ambigu (`fallback=true` ikut menjalankan pemilih cadangan) |
 | GET | `/api/skills/preview/:name?model=...&budget=...` | Teks skill persis seperti yang akan disisipkan (sudah dibersihkan dan sesuai budget) |
 | POST | `/v1/chat/completions` | Proxy ke 9Router; skill yang relevan, context pack aktif, dan catatan memori yang cocok disisipkan ke system prompt |
@@ -147,6 +155,9 @@ Bila port 6380 tidak bisa dijangkau setelah container jalan, buka port itu di fi
 | DELETE | `/api/mcp/servers/:name/connection` | Hapus login server MCP |
 | GET | `/api/mcp/oauth/callback` | Tujuan balik setelah login OAuth (dipanggil browser) |
 | GET | `/api/mcp/tools?q=` | Tool MCP yang terhubung dan yang akan terpilih untuk sebuah pesan |
+| GET | `/images/:file` | Gambar hasil `generate_image` (link yang muncul di jawaban chat) |
+| GET | `/api/images?q=&page=&limit=` | Daftar gambar yang pernah dibuat (URL, prompt, alt, model) dari tabel `t_generated_images` |
+| GET | `/api/images/:id` | Detail satu gambar |
 | GET | `/api/context-packs` | Daftar context pack |
 | POST | `/api/context-packs` | Buat context pack, body `{"name","content","active"}` |
 | GET / PUT / DELETE | `/api/context-packs/:id` | Lihat, ubah (field yang dikirim saja), atau hapus context pack |
@@ -182,12 +193,13 @@ Catatan:
 
 ## Proxy ke 9Router
 
-Arahkan client OpenAI-compatible ke middleware ini sebagai pengganti 9Router; selebihnya sama. Alamat 9Router diatur di `AI_ROUTER_BASE_URL` (wajib, mis. `https://host/v1`); path `/v1/xyz` dari client diteruskan ke `<AI_ROUTER_BASE_URL>/xyz`.
+Arahkan client OpenAI-compatible ke middleware ini sebagai pengganti 9Router; selebihnya sama. Alamat 9Router dikirim client di header `X-Router-URL` (mis. `https://host/v1`); path `/v1/xyz` dari client diteruskan ke `<X-Router-URL>/xyz`.
 
 ```bash
 curl http://localhost:4000/v1/chat/completions \
-  -H "Authorization: Bearer <KEY 9ROUTER>" -H "Content-Type: application/json" \
-  -d '{"model":"...","messages":[{"role":"user","content":"berapa harga yang pas untuk produk saya"}]}'
+  -H "X-API-Key: <API_KEYS>" -H "X-Router-URL: https://<domain-9router>/v1" -H "X-Router-Key: <KEY 9ROUTER MILIK USER>" -H "X-User-Id: user-123" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"AI-Crypro","messages":[{"role":"user","content":"berapa harga yang pas untuk produk saya"}]}'
 ```
 
 Untuk `POST /v1/chat/completions`:
@@ -197,9 +209,9 @@ Untuk `POST /v1/chat/completions`:
 4. Request diteruskan ke 9Router, respons (termasuk SSE) dialirkan balik tanpa ditampung.
 
 Catatan:
-- Header `Authorization` dari client diteruskan apa adanya. Middleware tidak menyimpan atau memakai key sendiri, dan tidak ada autentikasi/role di middleware; 9Router yang memeriksa key.
+- Middleware adalah alat di depan 9Router milik user: setiap user mengirim **alamat 9Router miliknya** di header `X-Router-URL` (wajib, 400 bila tidak ada atau tidak valid), **key 9Router miliknya** di header `X-Router-Key` (wajib untuk semua `/v1/*`, 401 bila tidak ada) dan **model miliknya** di field `model` (wajib, 400 bila tidak ada). Semua panggilan ke 9Router selama chat itu (jawaban, tool, gambar, pemilih cadangan, ekstraksi memori) memakai key dan model user tersebut. Middleware tidak punya alamat, key, atau model 9Router sendiri di `.env`. Alamat yang mengarah ke jaringan internal (localhost, IP privat, metadata cloud) ditolak, kecuali `ROUTER_ALLOW_PRIVATE_NETWORK=true`. Header `Authorization` dari client diabaikan; akses ke middleware dijaga header `X-API-Key`.
 - Hanya field `messages` yang diubah, ditambah `"stream": false` bila client tidak mengirim field `stream`. Standar OpenAI menetapkan bawaannya false, tetapi 9Router menjawab SSE bila field itu tidak ada, sehingga SDK OpenAI yang menunggu JSON akan gagal. Field lain di body, termasuk yang tidak dikenal, dibiarkan.
-- Header client (termasuk `User-Agent`) diteruskan apa adanya. 9Router berada di belakang Cloudflare yang memblokir User-Agent bawaan Python (`Python-urllib`) dengan 403; client Python sebaiknya memakai SDK OpenAI atau mengisi User-Agent sendiri.
+- Header client (termasuk `User-Agent`) diteruskan apa adanya, kecuali `X-API-Key`, `X-Router-URL`, `X-Router-Key`, dan `X-User-Id` yang dibuang. 9Router berada di belakang Cloudflare yang memblokir User-Agent bawaan Python (`Python-urllib`) dengan 403; client Python sebaiknya memakai SDK OpenAI atau mengisi User-Agent sendiri.
 - Respons diberi header `X-Skill: <nama>` bila ada skill yang disisipkan.
 - Gagal terbuka: bila langkah skill gagal (body bukan JSON, file skill hilang), request tetap diteruskan tanpa skill dan masalahnya dicatat di log.
 - Body maksimal 20 MB (413 bila lebih). Error dari proxy sendiri (413, 502, 504) berbentuk `{"error":{"message","type"}}` agar terbaca SDK OpenAI.
@@ -261,7 +273,7 @@ Varian yang dipakai (`full`, `short`, `truncated`) dicatat di `t_usage_logs`. To
 
 ## Cache (Redis)
 
-Dua cache di Redis, dengan key berawalan `skillmw:`. Isinya hanya nama folder skill dan skor; key berupa hash, tidak memuat isi pesan atau header `Authorization`.
+Dua cache di Redis, dengan key berawalan `skillmw:`. Isinya hanya nama folder skill dan skor; key berupa hash, tidak memuat isi pesan.
 
 | Cache | Isi | Masa berlaku |
 |---|---|---|
@@ -270,7 +282,7 @@ Dua cache di Redis, dengan key berawalan `skillmw:`. Isinya hanya nama folder sk
 
 **Cache sesi.** Isi skill harus dikirim ulang di setiap request karena model tidak menyimpan apa pun. Dengan cache sesi, pesan lanjutan seperti "oke lanjut" atau "terima kasih" tetap memakai skill yang sama. Skill aktif baru diganti bila skill lain **jauh lebih cocok**: skornya minimal `SKILL_SWITCH_RATIO` (1.5) kali skor skill aktif untuk pesan yang sama.
 
-**Mengenali percakapan.** Format OpenAI tidak punya ID percakapan, jadi dipakai header `X-Conversation-Id` bila client mengirimnya, atau pesan user pertama (yang selalu ikut terkirim). Header `Authorization` ikut di-hash supaya percakapan dua pengguna berbeda tidak bertabrakan. Dua percakapan dari pengguna yang sama yang dimulai dengan pesan identik dianggap satu percakapan, kecuali client mengirim `X-Conversation-Id`.
+**Mengenali percakapan.** Format OpenAI tidak punya ID percakapan, jadi dipakai header `X-Conversation-Id` bila client mengirimnya, atau pesan user pertama (yang selalu ikut terkirim). `user_id` (header `X-User-Id`) ikut di-hash supaya percakapan dua user berbeda tidak bertabrakan. Dua percakapan dari pengguna yang sama yang dimulai dengan pesan identik dianggap satu percakapan, kecuali client mengirim `X-Conversation-Id`.
 
 **Cache hasil seleksi.** Pesan yang sama setelah normalisasi (huruf kecil, tanpa kata umum, urutan kata diabaikan) memakai hasil sebelumnya. Dengan BM25 yang hanya butuh mikrodetik, manfaatnya saat ini kecil; cache ini disiapkan untuk Tahap 3 saat pemilihan memakai embedding yang jauh lebih mahal.
 
@@ -278,7 +290,7 @@ Dua cache di Redis, dengan key berawalan `skillmw:`. Isinya hanya nama folder sk
 
 ## Pemilih Cadangan
 
-Seleksi utama tetap tanpa LLM. Model 9Router (`SKILL_FALLBACK_MODEL`) hanya dipanggil saat skor **ambigu**:
+Seleksi utama tetap tanpa LLM. Model 9Router milik user (sama dengan `model` chat-nya) hanya dipanggil saat skor **ambigu** (`SKILL_FALLBACK_ENABLED=true`):
 - dua skill atau lebih bersaing ketat (skor BM25 >= `SKILL_AMBIGUOUS_RATIO` x skor teratas, bawaan 0.8), atau
 - skor teratas sedikit di bawah threshold (antara 50% dan 100% dari `SKILL_MIN_SCORE`).
 
@@ -293,7 +305,7 @@ Untuk melihat apakah sebuah pesan akan memicu pemilih cadangan: `GET /api/skills
 Embedding memilih skill berdasarkan **makna**, jadi pesan Indonesia bisa cocok dengan deskripsi skill berbahasa Inggris tanpa `keywords`. Embedding **dimatikan selama `EMBEDDING_MODEL` kosong** (seleksi memakai BM25). Saat ini 9Router belum punya provider embedding (`/v1/embeddings` menjawab "No credentials for provider: openai"), jadi bagian ini siap tetapi belum aktif.
 
 Cara mengaktifkan, salah satu:
-- tambahkan provider embedding (mis. OpenAI) di dashboard 9Router, lalu isi `EMBEDDING_MODEL` dengan nama modelnya; alamat dan key mengikuti `AI_ROUTER_*`;
+- tambahkan provider embedding (mis. OpenAI) di dashboard 9Router, lalu isi `EMBEDDING_MODEL` dengan nama modelnya, `EMBEDDING_BASE_URL` dengan alamat 9Router itu, dan `EMBEDDING_API_KEY`;
 - atau pasang Ollama dengan model `bge-m3` (mendukung bahasa Indonesia), lalu isi `EMBEDDING_BASE_URL=http://localhost:11434/v1` dan `EMBEDDING_MODEL=bge-m3`.
 
 Perilaku:
@@ -323,15 +335,16 @@ cases:
 
 ```bash
 curl -X POST http://localhost:4000/api/evals/runs -H "Content-Type: application/json" \
-  -d '{"skill":"founder-pricing"}'
+  -H "X-API-Key: <API_KEYS>" -H "X-User-Id: admin" -H "X-Router-URL: https://<domain-9router>/v1" -H "X-Router-Key: <KEY 9ROUTER>" \
+  -d '{"skill":"founder-pricing","model":"AI-Crypro"}'
 ```
 
-Tanpa `variants`, yang dibandingkan: `full` (SKILL.md), `short` (SHORT.md, bila ada), dan `none` (tanpa skill, sebagai pembanding). Opsional: `model` (model yang diuji, bawaan `EVAL_TARGET_MODEL`) dan `limit` (jumlah pertanyaan). Eval berjalan di latar belakang dan langsung mengembalikan `run_id`.
+Tanpa `variants`, yang dibandingkan: `full` (SKILL.md), `short` (SHORT.md, bila ada), dan `none` (tanpa skill, sebagai pembanding). `model` (model 9Router yang diuji) wajib, dan key 9Router dikirim di header `X-Router-Key` (401 bila tidak ada). Opsional: `judge_model` (bawaan sama dengan `model`) dan `limit` (jumlah pertanyaan). Eval berjalan di latar belakang dan langsung mengembalikan `run_id`.
 
 **3. Lihat hasil:** `GET /api/evals/runs/<run_id>` berisi skor rata-rata per varian, rata-rata token skill dan token prompt, jumlah yang gagal, serta kesimpulan otomatis, misalnya "SHORT.md setara dengan SKILL.md ... layak dipakai" atau "Skill hampir tidak menaikkan skor dibanding tanpa skill". Tambah `?detail=true` untuk melihat setiap jawaban, skor, dan alasan hakim.
 
 Catatan:
-- Hakim (`EVAL_JUDGE_MODEL`) menilai 0-10 berdasarkan `criteria`, **tanpa diberi tahu varian mana** yang menjawab, supaya tidak berat sebelah.
+- Hakim (`judge_model`, bawaan sama dengan `model`) menilai 0-10 berdasarkan `criteria`, **tanpa diberi tahu varian mana** yang menjawab, supaya tidak berat sebelah.
 - Setiap baris menyimpan `skill_version` (hash SKILL.md + SHORT.md), jadi hasil sebelum dan sesudah skill diedit bisa dibandingkan.
 - Biaya: jumlah pertanyaan x jumlah varian x 2 panggilan model (menjawab + menilai). Dengan 20 pertanyaan dan 3 varian = 120 panggilan, dan pada 9Router asli sekitar 2.200 token per panggilan. Jalankan saat skill berubah, bukan terus-menerus.
 - Hasil tersimpan di tabel `t_eval_runs`. Eval yang sedang berjalan saat server di-restart berhenti di tengah; hasil yang sudah selesai tetap tersimpan.
@@ -349,7 +362,7 @@ curl -X POST http://localhost:4000/api/context-packs -H "Content-Type: applicati
 
 **2. Catatan memori (`t_memory_notes`)**: pengalaman yang pernah dicoba beserta hasilnya, dengan bentuk *topik, yang dicoba, hasil, sumber hasil (`user`/`data`), pelajaran*. Siklusnya:
 
-1. **Ekstraksi otomatis.** Setelah respons chat selesai, pesan user terakhir diperiksa. Bila memuat sinyal hasil (berhasil, gagal, omzet, laku, naik, turun, untung, rugi, terjual, ...), model `MEMORY_EXTRACT_MODEL` mengekstraknya di latar belakang menjadi catatan berstatus `proposed`. Model hanya boleh mencatat hal yang sudah dicoba dan hasilnya sudah terjadi, bukan rencana atau saran asisten. Pesan tanpa sinyal tidak memanggil model sama sekali. Pesan yang sama (misalnya request diulang client) tidak diekstrak dua kali.
+1. **Ekstraksi otomatis.** Setelah respons chat selesai, pesan user terakhir diperiksa. Bila memuat sinyal hasil (berhasil, gagal, omzet, laku, naik, turun, untung, rugi, terjual, ...), model chat milik user (dengan key-nya) mengekstraknya di latar belakang menjadi catatan berstatus `proposed`. Model hanya boleh mencatat hal yang sudah dicoba dan hasilnya sudah terjadi, bukan rencana atau saran asisten. Pesan tanpa sinyal tidak memanggil model sama sekali. Pesan yang sama (misalnya request diulang client) tidak diekstrak dua kali.
 2. **Konfirmasi lewat API.** Catatan usulan tidak dipakai sampai dikonfirmasi (`POST /:id/confirm` -> `active`), dikoreksi (`PUT /:id` -> `corrected`, langsung dipakai), ditolak (`POST /:id/reject`), atau dihapus. Catatan yang ditolak atau dihapus tetap disimpan barisnya supaya isi yang sama tidak diusulkan lagi. Catatan manual (`POST /api/memory-notes`) langsung aktif.
 3. **Penyisipan.** Untuk setiap pesan, catatan `active`/`corrected` yang belum kedaluwarsa dicari dengan pencarian teks PostgreSQL (kolom `search_vector` dan index GIN, konfigurasi `simple`). Yang dipakai hanya catatan yang memuat paling sedikit `MEMORY_MIN_MATCH` kata pesan, maksimal `MEMORY_MAX_NOTES`, dan masing-masing dibatasi `MEMORY_NOTE_MAX_TOKENS`. Model diminta memperlakukannya sebagai **pengingat yang perlu dicek ulang, bukan larangan**: bila rencana user mengulang pola yang dulu gagal, model menyebutkannya lebih dulu lalu menawarkan alternatif.
 4. **Kedaluwarsa.** Catatan berlaku `MEMORY_NOTE_TTL` sejak dikonfirmasi/dikoreksi (bawaan 90 hari), karena hasil bisnis bisa basi.
@@ -367,7 +380,7 @@ Catatan:
 - PostgreSQL tidak punya kamus bahasa Indonesia, jadi akhiran kata ditangani dengan pencarian prefix (`diskon:*` juga cocok dengan "diskonnya"). Hasilnya lalu disaring lagi dengan tokenizer yang sama dengan seleksi skill.
 - Pencarian catatan dibatasi `MEMORY_LOOKUP_TIMEOUT`. Bila lewat atau database gagal, request jalan tanpa catatan (gagal terbuka).
 - Ekstraksi yang berjalan bersamaan dibatasi `MEMORY_EXTRACT_CONCURRENCY`. Bila antrean penuh, ekstraksi dilewati. Biaya token ekstraksi dicatat di log aplikasi (`ekstraksi memori selesai`).
-- `MEMORY_EXTRACT_MODEL` kosong = ekstraksi mati, tetapi catatan manual dan penyisipan tetap berjalan. `MEMORY_MAX_NOTES=0` mematikan penyisipan catatan.
+- `MEMORY_EXTRACT_ENABLED=false` = ekstraksi mati, tetapi catatan manual dan penyisipan tetap berjalan. `MEMORY_MAX_NOTES=0` mematikan penyisipan catatan.
 
 ## MCP (Canva, Figma, dan lainnya)
 
@@ -399,6 +412,10 @@ Client ──chat──▶ middleware ──(chat + tool yang cocok)──▶ 9R
 
 **2. Login sekali per server (OAuth)**: buka `http://<BASE_URL>/api/mcp/servers/canva/connect` di browser, lalu login dan setujui akses. Middleware otomatis mencari alamat login, mendaftarkan dirinya sebagai aplikasi OAuth, dan memakai PKCE. Akun yang dipakai adalah **satu akun bersama** untuk semua chat. Token disimpan terenkripsi (`MCP_TOKEN_KEY`) di `m_mcp_credentials` dan diperpanjang otomatis. `BASE_URL` harus bisa dibuka dari browser, karena halaman login kembali ke `BASE_URL/api/mcp/oauth/callback`.
 
+**MCP per user:** server bawaan ada di `mcp.json` (untuk semua user), server tambahan disimpan per user di `m_mcp_servers`, dan tiap user login ke akunnya sendiri (token di `m_mcp_credentials` per user). Link login dari chat ditandatangani supaya tidak bisa dipakai untuk user lain.
+
+**Kelola MCP lewat chat:** "mcp apa aja yang tersambung?", "konekan saya ke canva" (diberi link login), "tambahkan MCP notion, url-nya https://..." (URL dicek, disimpan sebagai server milik user itu, langsung aktif), dan "hapus MCP notion". Tool bawaan: `list_connections`, `connect_service`, `add_mcp_server`, `remove_mcp_server`. Detail di [`docs/10-mcp.md`](docs/10-mcp.md).
+
 **3. Setelah itu berjalan sendiri di setiap chat:**
 - Tool dipilih **otomatis sesuai pesan** (BM25 pada nama server, `keywords`, nama dan deskripsi tool, dari dua pesan user terakhir). Maksimal `MCP_MAX_TOOLS` tool dengan skor ≥ `MCP_TOOL_MIN_SCORE`.
 - Pesan yang tidak menyinggung tool apa pun ("halo") diteruskan biasa tanpa tool dan tanpa tambahan token.
@@ -420,6 +437,17 @@ Catatan:
 
 Penjelasan lengkap: [`docs/10-mcp.md`](docs/10-mcp.md).
 
+## Gambar lewat Chat
+
+Chat seperti "buatkan gambar logo kedai kopi, minimalis warna coklat" bisa menghasilkan gambar yang langsung tampil di jawaban (`![alt](BASE_URL/images/<nama>.png)`). Middleware memberi model tool bawaan **`generate_image`** (lewat putaran tool yang sama dengan MCP):
+
+1. Tool hanya ditawarkan bila pesan menyinggung gambar (gambar, ilustrasi, logo, foto, poster, ikon, ...), jadi chat biasa tidak bertambah token.
+2. Model menulis prompt detail lalu memanggil tool; middleware memanggil `POST /images/generations` di 9Router dengan key user, memakai model gambar yang tersedia di akun user itu.
+3. Gambar disimpan di `IMAGE_PATH` dan disajikan di `GET /images/<nama>`; model menampilkannya dengan markdown.
+4. URL, prompt, alt, model, dan ukurannya dicatat di tabel `t_generated_images`, bisa dibaca lewat `GET /api/images`.
+
+Model gambar **tidak ditulis di `.env`**: daftarnya diambil otomatis dari akun 9Router user (`GET /v1/models/image`, di-cache 10 menit per akun) lalu dicoba berurutan; model yang menolak dilewati sementara. Akun tanpa model gambar tidak ditawari tool ini. Saat ini `cx/gpt-image-*` butuh ChatGPT Plus/Pro pada akun yang terhubung ke 9Router, dan `ag/gemini-3.1-flash-image` (gratis) sering penuh. `BASE_URL` harus bisa dibuka aplikasi chat supaya gambar tampil. Penjelasan lengkap: [`docs/11-gambar.md`](docs/11-gambar.md).
+
 ## Index Skill
 
 Saat start, middleware membaca `skills/*/SKILL.md` dan menyimpan `name`, `description`, `keywords`, serta ada tidaknya `SHORT.md` di memori. Isi skill tidak disimpan di index; dibaca dari disk saat skill terpilih.
@@ -428,6 +456,10 @@ Saat start, middleware membaca `skills/*/SKILL.md` dan menyimpan `name`, `descri
 - Index baru dibangun terpisah lalu ditukar dalam satu langkah atomik, jadi request yang sedang berjalan tidak pernah melihat index setengah jadi.
 - Folder tanpa `SKILL.md`, dengan frontmatter rusak, atau `description` kosong dilewati dan dicatat di log, tanpa menggagalkan skill lain.
 - Folder berawalan `.` (staging dan backup upload) diabaikan.
+
+## Impor Skill dari GitHub lewat Chat
+
+Tulis di chat: *"ambil skill dari https://github.com/owner/repo lalu jadikan zip"*. Tool bawaan **`import_skills_from_github`** (hanya ditawarkan bila pesan berisi link `github.com`) mengunduh repo, menyusun setiap folder ber-`SKILL.md` (di kedalaman berapa pun) menjadi zip skill yang rapi, memasangnya lewat proses upload yang sama (hanya file teks), lalu chat membalas dengan daftar skill dan link **Download zip** (`/api/skills/export?names=...`). Skill yang sudah ada tidak ditimpa tanpa persetujuan user. Saat ini semua user chat boleh memasang skill. Detail: [`docs/03-skill.md`](docs/03-skill.md).
 
 ## Daftar Skill
 

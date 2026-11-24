@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+
+	"github.com/Bauagg/middleware-skill-ai/internal/database"
 	"gorm.io/gorm/clause"
 )
 
@@ -37,6 +39,11 @@ func NewRepository(db *gorm.DB) *Repository {
 // Migrate menambahkan kolom dan index pencarian teks. Dipanggil setelah
 // AutoMigrate membuat tabelnya.
 func (r *Repository) Migrate() error {
+	// index unik lama (note_hash global, dari sebelum ada user_id) diganti
+	// index unik (user_id, note_hash) yang dibuat AutoMigrate
+	if err := r.db.Exec(`DROP INDEX IF EXISTS idx_t_memory_notes_note_hash`).Error; err != nil {
+		return err
+	}
 	for _, sql := range searchSchema {
 		if err := r.db.Exec(sql).Error; err != nil {
 			return err
@@ -49,7 +56,7 @@ func (r *Repository) Migrate() error {
 // hanya catatan yang cocok yang diambil, diurutkan dari yang paling relevan.
 func (r *Repository) List(f ListFilter, tsq string) ([]MemoryNote, int64, error) {
 	base := func() *gorm.DB {
-		q := r.db.Model(&MemoryNote{})
+		q := database.ByUser(r.db.Model(&MemoryNote{}), f.UserID) // "" = semua user (admin)
 		if f.Status != "" {
 			q = q.Where("status = ?", f.Status)
 		} else {
@@ -84,24 +91,25 @@ func (r *Repository) List(f ListFilter, tsq string) ([]MemoryNote, int64, error)
 
 // Search mengambil catatan yang boleh dipakai (aktif/dikoreksi, belum
 // kedaluwarsa) dan cocok dengan tsq, paling relevan lebih dulu.
-func (r *Repository) Search(ctx context.Context, tsq string, limit int) ([]Hit, error) {
+func (r *Repository) Search(ctx context.Context, userID, tsq string, limit int) ([]Hit, error) {
 	var hits []Hit
 	err := r.db.WithContext(ctx).Raw(`
 		SELECT n.*, ts_rank(n.search_vector, q) AS rank
 		FROM t_memory_notes n, to_tsquery('simple', ?) q
 		WHERE n.search_vector @@ q
+		  AND n.user_id = ?
 		  AND n.status IN ?
 		  AND (n.expires_at IS NULL OR n.expires_at > ?)
 		ORDER BY rank DESC, n.created_at DESC
-		LIMIT ?`, tsq, usableStatuses, time.Now(), limit).
+		LIMIT ?`, tsq, userID, usableStatuses, time.Now(), limit).
 		Scan(&hits).Error
 	return hits, err
 }
 
 // Get mengambil satu catatan (gorm.ErrRecordNotFound bila tidak ada).
-func (r *Repository) Get(id string) (*MemoryNote, error) {
+func (r *Repository) Get(userID, id string) (*MemoryNote, error) {
 	var row MemoryNote
-	if err := r.db.First(&row, "id = ?", id).Error; err != nil {
+	if err := database.ByUser(r.db, userID).First(&row, "id = ?", id).Error; err != nil {
 		return nil, err
 	}
 	return &row, nil
@@ -120,21 +128,21 @@ func (r *Repository) CreateIgnore(ctx context.Context, rows []MemoryNote) (int64
 		return 0, nil
 	}
 	res := r.db.WithContext(ctx).
-		Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "note_hash"}}, DoNothing: true}).
+		Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "user_id"}, {Name: "note_hash"}}, DoNothing: true}).
 		Create(&rows)
 	return res.RowsAffected, res.Error
 }
 
 // SourceSeen melaporkan apakah pesan dengan hash ini sudah pernah diekstrak.
-func (r *Repository) SourceSeen(ctx context.Context, hash string) (bool, error) {
+func (r *Repository) SourceSeen(ctx context.Context, userID, hash string) (bool, error) {
 	var n int64
-	err := r.db.WithContext(ctx).Model(&MemoryNote{}).Where("source_hash = ?", hash).Limit(1).Count(&n).Error
+	err := r.db.WithContext(ctx).Model(&MemoryNote{}).Where("user_id = ? AND source_hash = ?", userID, hash).Limit(1).Count(&n).Error
 	return n > 0, err
 }
 
 // Update mengubah kolom tertentu.
-func (r *Repository) Update(id string, fields map[string]any) error {
-	return r.db.Model(&MemoryNote{}).Where("id = ?", id).Updates(fields).Error
+func (r *Repository) Update(userID, id string, fields map[string]any) error {
+	return database.ByUser(r.db.Model(&MemoryNote{}), userID).Where("id = ?", id).Updates(fields).Error
 }
 
 // tsQuery menyusun query to_tsquery dari kata-kata pesan: kata digabung dengan

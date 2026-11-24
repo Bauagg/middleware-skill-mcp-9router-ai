@@ -24,12 +24,14 @@ Bagi client, middleware ini terlihat sama persis seperti 9Router (format OpenAI)
 | 8 | [Konfigurasi](08-konfigurasi.md) | Semua variabel `.env` dan nilai bawaannya |
 | 9 | [Menjalankan, deploy, dan masalah umum](09-menjalankan-dan-deploy.md) | Menjalankan lokal, Redis DEV, deploy dengan Docker Compose, dan solusi error yang sering muncul |
 | 10 | [MCP](10-mcp.md) | Koneksi ke Canva, Figma, dan server MCP lain: login OAuth, pemilihan tool, putaran panggil-tool |
+| 11 | [Gambar lewat chat](11-gambar.md) | Tool bawaan `generate_image`: chat "buatkan gambar ..." menghasilkan gambar yang tampil di jawaban |
+| 12 | [Akun, login, dan role](12-akun-dan-login.md) | Register/login/refresh token, role admin dan user, siapa melihat data siapa |
 
 ## Ringkasan cepat
 
 - **Bahasa dan pustaka:** Go, Gin (HTTP), GORM + PostgreSQL, Redis, zap (log).
 - **Wajib saat start:** PostgreSQL, Redis, dan alamat serta key 9Router. Bila salah satu gagal, server berhenti dengan pesan error.
-- **Tanpa autentikasi:** semua endpoint `/api/*` terbuka. Request `/v1/*` diteruskan dengan key 9Router milik client sendiri.
+- **Autentikasi:** aplikasi pihak ketiga memakai `X-API-Key` + `X-User-Id`; user yang register di middleware memakai `Authorization: Bearer <access_token>`. Admin melihat data semua user, user hanya miliknya; skill global. Chat memakai 9Router milik user (`X-Router-URL`, `X-Router-Key`, `model`).
 - **Folder skill:** `skills/` (diatur `PATH_FILE_UPLOAD`). Hanya folder ini yang dibaca middleware.
 - **Asal desain:** dokumen *Desain Middleware Skill untuk 9Router*, Tahap 1 sampai 4. Semua tahap sudah dibangun.
 

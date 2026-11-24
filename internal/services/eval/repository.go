@@ -1,6 +1,10 @@
 package eval
 
-import "gorm.io/gorm"
+import (
+	"gorm.io/gorm"
+
+	"github.com/Bauagg/middleware-skill-ai/internal/database"
+)
 
 // Repository adalah akses ke tabel t_eval_runs.
 type Repository struct {
@@ -18,20 +22,20 @@ func (r *Repository) Save(row *EvalRun) error {
 }
 
 // ByRun mengambil semua hasil satu eval, terurut per varian dan pertanyaan.
-func (r *Repository) ByRun(runID string) ([]EvalRun, error) {
+func (r *Repository) ByRun(userID, runID string) ([]EvalRun, error) {
 	var rows []EvalRun
-	err := r.db.Where("run_id = ?", runID).Order("variant, case_index").Find(&rows).Error
+	err := database.ByUser(r.db, userID).Where("run_id = ?", runID).Order("variant, case_index").Find(&rows).Error
 	return rows, err
 }
 
 // Runs mengambil daftar eval terbaru, opsional untuk satu skill.
-func (r *Repository) Runs(skill string, limit int) ([]RunListItem, error) {
-	q := r.db.Model(&EvalRun{}).
-		Select(`run_id, skill, skill_version, model, judge_model,
+func (r *Repository) Runs(userID, skill string, limit int) ([]RunListItem, error) {
+	q := database.ByUser(r.db.Model(&EvalRun{}), userID).
+		Select(`run_id, user_id, skill, skill_version, model, judge_model,
 			MIN(created_at) AS started_at,
 			COUNT(*) AS row_count,
 			ROUND(AVG(score)::numeric, 2)::float8 AS avg_score`).
-		Group("run_id, skill, skill_version, model, judge_model").
+		Group("run_id, user_id, skill, skill_version, model, judge_model").
 		Order("started_at DESC").
 		Limit(limit)
 	if skill != "" {

@@ -24,6 +24,9 @@ func (r *Repository) CreateBatch(logs []UsageLog) error {
 // List mengambil log terbaru lebih dulu, beserta total baris yang cocok filter.
 func (r *Repository) List(f ListFilter) ([]UsageLog, int64, error) {
 	q := r.db.Model(&UsageLog{})
+	if f.UserID != "" {
+		q = q.Where("user_id = ?", f.UserID)
+	}
 	if f.Model != "" {
 		q = q.Where("model = ?", f.Model)
 	}
@@ -130,6 +133,9 @@ func (r *Repository) countBy(column string, f SummaryFilter) (map[string]int64, 
 
 // inRange menerapkan batas waktu ringkasan.
 func (r *Repository) inRange(q *gorm.DB, f SummaryFilter) *gorm.DB {
+	if f.UserID != "" {
+		q = q.Where("user_id = ?", f.UserID)
+	}
 	if f.From != nil {
 		q = q.Where("created_at >= ?", *f.From)
 	}

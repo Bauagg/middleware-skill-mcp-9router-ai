@@ -24,13 +24,17 @@ const (
 )
 
 // MemoryNote adalah satu baris tabel t_memory_notes: satu pengalaman yang
-// pernah dicoba beserta hasilnya. Memori ini global (tidak terikat user).
+// pernah dicoba beserta hasilnya, milik satu user.
 //
 // Kolom search_vector (tsvector, untuk pencarian teks PostgreSQL) sengaja tidak
 // ada di struct: kolom itu dihitung database sendiri (generated column) dan
 // dibuat oleh Repository.Migrate.
 type MemoryNote struct {
 	ID string `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+
+	// UserID pemilik catatan (header X-User-Id). Catatan hanya dipakai di chat
+	// user yang sama.
+	UserID string `json:"user_id" gorm:"size:128;not null;default:'';index;uniqueIndex:idx_t_memory_notes_user_note,priority:1"`
 
 	Topic        string `json:"topic" gorm:"size:200;not null"`
 	Tried        string `json:"tried" gorm:"type:text;not null"`
@@ -50,7 +54,7 @@ type MemoryNote struct {
 	// NoteHash adalah sha256 isi catatan (topik, yang dicoba, hasil). Unik,
 	// supaya catatan yang sama tidak tersimpan dua kali, termasuk yang sudah
 	// ditolak atau dihapus (tidak diusulkan lagi).
-	NoteHash string `json:"-" gorm:"size:64;not null;uniqueIndex"`
+	NoteHash string `json:"-" gorm:"size:64;not null;uniqueIndex:idx_t_memory_notes_user_note,priority:2"`
 
 	// ExtractModel adalah model yang mengekstrak catatan (kosong bila manual).
 	ExtractModel string `json:"extract_model" gorm:"size:200"`

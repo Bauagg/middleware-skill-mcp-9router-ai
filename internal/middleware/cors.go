@@ -11,10 +11,12 @@ import (
 // Untuk produksi, persempit AllowOrigins ke domain yang diizinkan.
 func CORS() gin.HandlerFunc {
 	return cors.New(cors.Config{
-		AllowOrigins:     []string{"*"},
-		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
-		ExposeHeaders:    []string{"Content-Length"},
+		AllowOrigins: []string{"*"},
+		AllowMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		// X-API-Key (secret key client), X-User-Id (identitas user), dan
+		// X-Conversation-Id harus diizinkan supaya aplikasi web bisa mengirimnya
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-API-Key", "X-Router-Key", "X-Router-URL", "X-User-Id", "X-Conversation-Id"},
+		ExposeHeaders:    []string{"Content-Length", "X-Skill", "X-MCP-Tools"},
 		AllowCredentials: false,
 		MaxAge:           12 * time.Hour,
 	})

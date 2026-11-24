@@ -4,6 +4,7 @@ import "time"
 
 // Entry adalah satu catatan pemakaian yang dikirim proxy.
 type Entry struct {
+	UserID string
 	Model  string
 	Path   string
 	Stream bool
@@ -41,16 +42,18 @@ type Entry struct {
 
 // ListFilter adalah parameter daftar log.
 type ListFilter struct {
-	Model string
-	Skill string
-	Page  int
-	Limit int
+	UserID string // kosong = semua user
+	Model  string
+	Skill  string
+	Page   int
+	Limit  int
 }
 
 // SummaryFilter membatasi rentang waktu ringkasan (nil = tanpa batas).
 type SummaryFilter struct {
-	From *time.Time
-	To   *time.Time
+	UserID string // kosong = semua user
+	From   *time.Time
+	To     *time.Time
 }
 
 // SummaryResult adalah ringkasan pemakaian pada rentang waktu tertentu.

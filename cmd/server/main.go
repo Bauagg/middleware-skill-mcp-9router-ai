@@ -21,6 +21,7 @@ import (
 	"github.com/Bauagg/middleware-skill-ai/internal/database"
 	"github.com/Bauagg/middleware-skill-ai/internal/logger"
 	"github.com/Bauagg/middleware-skill-ai/internal/middleware"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/jwtauth"
 	"github.com/Bauagg/middleware-skill-ai/internal/router"
 )
 
@@ -71,8 +72,15 @@ func main() {
 	}
 	logger.Info("database connected")
 
+	// token login (register/login di middleware) untuk user tanpa aplikasi pihak ketiga
+	tokens, err := jwtauth.NewIssuer(cfg.Auth.JWTSecret, cfg.Auth.AccessTTL, cfg.Auth.RefreshTTL)
+	if err != nil {
+		logger.Fatal("token login tidak bisa disiapkan", zap.Error(err))
+	}
+
 	r := gin.New()
-	r.Use(middleware.Recovery(), middleware.HTTPLogger(), middleware.CORS())
+	// Auth setelah CORS: preflight OPTIONS dijawab CORS tanpa butuh key/token
+	r.Use(middleware.Recovery(), middleware.HTTPLogger(), middleware.CORS(), middleware.Auth(cfg.App.APIKeys, tokens))
 
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(200, gin.H{"message": "Server is running"})
@@ -81,7 +89,7 @@ func main() {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
-	cleanup := router.Register(r, db, cfg)
+	cleanup := router.Register(r, db, cfg, tokens)
 
 	// http.Server (bukan r.Run) supaya bisa dimatikan dengan rapi: saat
 	// SIGTERM (docker stop / deploy ulang), request baru ditolak, request yang

@@ -25,6 +25,8 @@ services:
       PATH_FILE_UPLOAD: /app/skills
       LOG_DIR: /app/logs
       MCP_CONFIG_PATH: /app/mcp.json
+      IMAGE_PATH: /app/images
+      WEB_SEARCH_URL: http://searxng:8080
 
     # API /api/* tidak memakai autentikasi, jadi bawaannya hanya bisa diakses
     # dari VPS sendiri (127.0.0.1); buka ke publik lewat NGINX. Ubah lewat
@@ -41,9 +43,13 @@ services:
     volumes:
       - skills_data:/app/skills # skill hasil upload tidak hilang saat container dibuat ulang
       - logs_data:/app/logs
-      # daftar server MCP (Figma, Canva, ...); file harus ada sebelum compose
-      # dijalankan, perubahan berlaku setelah restart
+      - images_data:/app/images # gambar hasil generate lewat chat
+      # server MCP bawaan untuk semua user (Canva, ...). Server tambahan tiap user
+      # disimpan di database, jadi file ini cukup read-only. Perubahan butuh restart.
       - ./mcp.json:/app/mcp.json:ro
+
+    depends_on:
+      - searxng
 
     # server diberi waktu menyelesaikan request yang sedang berjalan (termasuk
     # streaming) dan menulis sisa log pemakaian sebelum dihentikan paksa
@@ -55,6 +61,26 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # mesin pencari untuk tool web_search (gratis, tanpa API key). Tidak dibuka ke
+  # publik: middleware memanggilnya lewat jaringan Docker (http://searxng:8080).
+  # Port 127.0.0.1:8888 hanya untuk cek dari VPS sendiri.
+  searxng:
+    image: searxng/searxng:latest
+    container_name: middleware-searxng
+    restart: unless-stopped
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?isi SEARXNG_SECRET di .env}
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    ports:
+      - "127.0.0.1:8888:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   skills_data:
   logs_data:
+  images_data:

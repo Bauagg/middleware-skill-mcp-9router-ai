@@ -38,7 +38,7 @@ Solusinya, skill yang terakhir dipakai disimpan di Redis per percakapan (`SKILL_
 1. header `X-Conversation-Id` bila client mengirimnya (disarankan), atau
 2. pesan user pertama, yang selalu ikut terkirim di setiap request.
 
-Header `Authorization` ikut di-hash supaya percakapan dua pengguna berbeda tidak tertukar. Yang disimpan di Redis hanya hash, bukan isi pesan atau key.
+`user_id` (header `X-User-Id`) ikut di-hash supaya percakapan dua user berbeda tidak tertukar. Yang disimpan di Redis hanya hash, bukan isi pesan.
 
 ## Cache hasil seleksi
 
@@ -48,13 +48,13 @@ Semua key Redis berawalan `skillmw:`.
 
 ## Pemilih cadangan (memanggil model hanya saat ragu)
 
-Model `SKILL_FALLBACK_MODEL` (saat ini AI-Crypro) dipanggil hanya bila skor **ambigu**:
+Model chat milik user (field `model`, dengan key `X-Router-Key`-nya) dipanggil hanya bila skor **ambigu**. Nyalakan/matikan dengan `SKILL_FALLBACK_ENABLED`:
 - dua skill atau lebih bersaing ketat (skor ≥ `SKILL_AMBIGUOUS_RATIO` × skor teratas, bawaan 0,8), atau
 - skor teratas sedikit di bawah threshold (antara 50% dan 100% dari `SKILL_MIN_SCORE`).
 
 Model diberi pesan user dan maksimal 3 kandidat, lalu hanya boleh menjawab satu nama kandidat atau `none`. Jawaban lain dianggap gagal, dan keputusan kembali ke skor.
 
-Biaya nyata: sekitar 2–7 detik dan sekitar 2.200 token per panggilan. `SKILL_FALLBACK_TIMEOUT` (5 detik) membatasi waktu tunggunya. Untuk mengecek apakah sebuah pesan ambigu: `GET /api/skills/match?q=...` (lihat field `ambiguous`), tambah `&fallback=true` untuk benar-benar menjalankannya.
+Biaya nyata: sekitar 2–7 detik dan sekitar 2.200 token per panggilan. `SKILL_FALLBACK_TIMEOUT` (5 detik) membatasi waktu tunggunya. Untuk mengecek apakah sebuah pesan ambigu: `GET /api/skills/match?q=...` (lihat field `ambiguous`), tambah `&fallback=true&model=<model>` dan header `X-Router-Key` untuk benar-benar menjalankannya.
 
 Jangan pakai model `kr/*` di 9Router. Saat ini model itu selalu menolak ("This version of Kiro is no longer supported").
 
@@ -63,7 +63,7 @@ Jangan pakai model `kr/*` di 9Router. Saat ini model itu selalu menolak ("This v
 Embedding memilih skill berdasarkan **makna**, bukan kata yang sama persis. Dengan embedding, pesan Indonesia bisa cocok dengan deskripsi berbahasa Inggris tanpa `keywords`.
 
 Status: **mati selama `EMBEDDING_MODEL` kosong**, karena 9Router belum punya provider embedding. Cara mengaktifkan:
-- tambahkan provider embedding di dashboard 9Router, lalu isi `EMBEDDING_MODEL`; atau
+- tambahkan provider embedding di dashboard 9Router, lalu isi `EMBEDDING_MODEL`, `EMBEDDING_BASE_URL` (alamat 9Router itu), dan `EMBEDDING_API_KEY`; atau
 - pasang Ollama dengan model `bge-m3`, lalu isi `EMBEDDING_BASE_URL=http://localhost:11434/v1` dan `EMBEDDING_MODEL=bge-m3`.
 
 Perilakunya:

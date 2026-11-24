@@ -27,14 +27,14 @@ FROM alpine:3.21
 # ca-certificates: koneksi HTTPS ke 9Router; tzdata: zona waktu Asia/Jakarta
 RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -S app && adduser -S -G app -H -h /app app \
-    && mkdir -p /app/skills /app/logs \
+    && mkdir -p /app/skills /app/logs /app/images \
     && chown -R app:app /app
 
 WORKDIR /app
 COPY --from=build /out/server /app/server
 
-# berjalan sebagai user biasa, bukan root. Folder skills dan logs dibuat
-# milik user ini supaya volume baru ikut bisa ditulis.
+# berjalan sebagai user biasa, bukan root. Folder skills, logs, dan images
+# dibuat milik user ini supaya volume baru ikut bisa ditulis.
 USER app
 
 ENV APP_ENV=production \
@@ -42,6 +42,7 @@ ENV APP_ENV=production \
     PORT=4000 \
     PATH_FILE_UPLOAD=/app/skills \
     LOG_DIR=/app/logs \
+    IMAGE_PATH=/app/images \
     TZ=Asia/Jakarta
 
 EXPOSE 4000

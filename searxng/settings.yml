@@ -1,0 +1,18 @@
+# Pengaturan SearXNG untuk middleware (tool web_search di chat).
+# Hanya dipakai middleware lewat jaringan internal Docker, tidak dibuka ke publik.
+# Kunci rahasia diambil dari env SEARXNG_SECRET (lihat .env), bukan dari file ini.
+use_default_settings: true
+
+general:
+  instance_name: "middleware-search"
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json # wajib: middleware memakai API JSON (/search?format=json)
+
+server:
+  limiter: false # tidak perlu pembatas: satu-satunya pemakai adalah middleware
+  image_proxy: false
+  secret_key: "diganti-oleh-env-SEARXNG_SECRET"

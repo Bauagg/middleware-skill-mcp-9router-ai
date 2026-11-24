@@ -21,6 +21,7 @@ import (
 
 	"github.com/Bauagg/middleware-skill-ai/internal/logger"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/openai"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/userctx"
 )
 
 // Result adalah hasil pengamatan satu penerusan request ke 9Router.
@@ -44,9 +45,7 @@ type NineRouter struct {
 	proxy *httputil.ReverseProxy
 
 	// untuk panggilan middleware sendiri (Complete), bukan request client
-	base   string
-	apiKey string
-	http   *http.Client
+	http *http.Client
 }
 
 // observer menampung hasil pengamatan satu request. Hanya disentuh dari
@@ -78,21 +77,27 @@ func (t *teeBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// NewNineRouter membuat klien dengan target alamat dasar 9Router (mis.
-// https://host/v1). Path request "/v1/xyz" dipetakan ke target.Path + "/xyz".
-// apiKey hanya dipakai untuk panggilan middleware sendiri (Complete); request
-// client tetap diteruskan dengan header Authorization miliknya.
-func NewNineRouter(target *url.URL, apiKey string) *NineRouter {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
-	transport.TLSHandshakeTimeout = 10 * time.Second
+// NewNineRouter membuat klien 9Router. Middleware tidak punya 9Router sendiri:
+// alamat (header X-Router-URL) dan key (header X-Router-Key) selalu milik
+// user, diambil dari context. Path request "/v1/xyz" dipetakan ke
+// <alamat user> + "/xyz". allowPrivate mengizinkan alamat di jaringan
+// internal (hanya untuk pengembangan). Header
+// Authorization dari client selalu diganti, dan header milik middleware tidak
+// ikut diteruskan.
+func NewNineRouter(allowPrivate bool) *NineRouter {
+	transport := newRouterTransport(allowPrivate)
 	// model bisa lama sebelum mengirim byte pertama (mis. model reasoning)
 	transport.ResponseHeaderTimeout = 5 * time.Minute
-	transport.MaxIdleConnsPerHost = 32
 
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			out := pr.Out
+			// alamat sudah divalidasi controller; bila tidak ada, Host kosong
+			// membuat request gagal dan dijawab 502 oleh ErrorHandler
+			target, _ := url.Parse(userctx.RouterURL(pr.In.Context()))
+			if target == nil {
+				target = &url.URL{}
+			}
 			out.URL.Scheme = target.Scheme
 			out.URL.Host = target.Host
 			out.URL.Path = target.Path + strings.TrimPrefix(pr.In.URL.Path, "/v1")
@@ -103,6 +108,16 @@ func NewNineRouter(target *url.URL, apiKey string) *NineRouter {
 			// tanpa ini respons bisa datang terkompresi dan token tidak bisa dibaca;
 			// bila dihapus, Go meminta gzip sendiri lalu mendekompresinya otomatis
 			out.Header.Del("Accept-Encoding")
+
+			// key 9Router milik user (X-Router-Key); header milik middleware
+			// (secret aplikasi, user_id) tidak perlu diketahui 9Router
+			out.Header.Del("Authorization")
+			if key := userctx.RouterKey(pr.In.Context()); key != "" {
+				out.Header.Set("Authorization", "Bearer "+key)
+			}
+			for _, h := range []string{"X-Api-Key", "X-Router-Key", "X-Router-Url", "X-User-Id"} {
+				out.Header.Del(h)
+			}
 		},
 		Transport: transport,
 
@@ -144,10 +159,8 @@ func NewNineRouter(target *url.URL, apiKey string) *NineRouter {
 		},
 	}
 	return &NineRouter{
-		proxy:  rp,
-		base:   strings.TrimRight(target.String(), "/"),
-		apiKey: apiKey,
-		http:   &http.Client{Transport: transport},
+		proxy: rp,
+		http:  &http.Client{Transport: transport},
 	}
 }
 
@@ -223,12 +236,20 @@ func (n *NineRouter) Complete(ctx context.Context, model string, messages []Chat
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.base+"/chat/completions", bytes.NewReader(body))
+	base, err := routerBase(ctx)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	key, err := routerKey(ctx)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+n.apiKey)
+	req.Header.Set("Authorization", "Bearer "+key)
 
 	resp, err := n.http.Do(req)
 	if err != nil {
@@ -261,34 +282,39 @@ func (n *NineRouter) Complete(ctx context.Context, model string, messages []Chat
 	return &Completion{Text: strings.TrimSpace(messageText(out.Choices[0].Message.Content)), Usage: sniffer.Usage()}, nil
 }
 
-// maxChatBytes membatasi respons yang dibaca Chat.
-const maxChatBytes = 16 << 20
-
-// Chat mengirim body chat completions apa adanya (harus tanpa streaming)
-// dengan header Authorization milik client, lalu mengembalikan status dan
-// body respons. Dipakai putaran tool MCP, yang perlu membaca jawaban model
-// utuh sebelum memutuskan langkah berikutnya.
-func (n *NineRouter) Chat(ctx context.Context, authorization string, body []byte) (int, []byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.base+"/chat/completions", bytes.NewReader(body))
+// ChatStream mengirim body chat completions (stream: true) memakai key 9Router
+// milik user (dari context) dan mengembalikan respons apa adanya; pemanggil
+// membaca SSE-nya dan wajib menutup Body. Dipakai putaran tool: streaming
+// membuat koneksi tidak pernah diam, sehingga jawaban panjang tidak diputus
+// Cloudflare (sekitar 100 detik tanpa data).
+func (n *NineRouter) ChatStream(ctx context.Context, body []byte) (*http.Response, error) {
+	base, err := routerBase(ctx)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if authorization != "" {
-		req.Header.Set("Authorization", authorization)
-	}
-
-	resp, err := n.http.Do(req)
+	req.Header.Set("Accept", "text/event-stream")
+	key, err := routerKey(ctx)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
-	defer resp.Body.Close()
+	req.Header.Set("Authorization", "Bearer "+key)
+	return n.http.Do(req)
+}
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxChatBytes))
-	if err != nil {
-		return 0, nil, fmt.Errorf("baca respons 9Router: %w", err)
+// ErrNoRouterKey berarti panggilan ke 9Router tidak membawa key milik user.
+var ErrNoRouterKey = errors.New("key 9Router milik user tidak ada (header X-Router-Key)")
+
+// routerKey mengambil key 9Router milik user dari context.
+func routerKey(ctx context.Context) (string, error) {
+	if k := userctx.RouterKey(ctx); k != "" {
+		return k, nil
 	}
-	return resp.StatusCode, raw, nil
+	return "", ErrNoRouterKey
 }
 
 // messageText membaca content jawaban yang bisa berupa string atau array bagian.

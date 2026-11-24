@@ -5,6 +5,7 @@ import (
 
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/apperror"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/response"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/userctx"
 )
 
 // Controller menangani request HTTP untuk context pack.
@@ -19,7 +20,7 @@ func NewController(service *Service) *Controller {
 
 // List menangani GET /api/context-packs.
 func (h *Controller) List(c *gin.Context) {
-	rows, err := h.service.List()
+	rows, err := h.service.List(userctx.Scope(c.Request.Context()))
 	if err != nil {
 		apperror.Handle(c, err)
 		return
@@ -29,7 +30,7 @@ func (h *Controller) List(c *gin.Context) {
 
 // Get menangani GET /api/context-packs/:id.
 func (h *Controller) Get(c *gin.Context) {
-	row, err := h.service.Get(c.Param("id"))
+	row, err := h.service.Get(userctx.Scope(c.Request.Context()), c.Param("id"))
 	if err != nil {
 		apperror.Handle(c, err)
 		return
@@ -44,7 +45,7 @@ func (h *Controller) Create(c *gin.Context) {
 		apperror.Handle(c, apperror.NewBadRequest("Validasi gagal", apperror.BindingErrors(err)...))
 		return
 	}
-	row, err := h.service.Create(in)
+	row, err := h.service.Create(userctx.From(c.Request.Context()), in)
 	if err != nil {
 		apperror.Handle(c, err)
 		return
@@ -59,7 +60,7 @@ func (h *Controller) Update(c *gin.Context) {
 		apperror.Handle(c, apperror.NewBadRequest("Validasi gagal", apperror.BindingErrors(err)...))
 		return
 	}
-	row, err := h.service.Update(c.Param("id"), in)
+	row, err := h.service.Update(userctx.Scope(c.Request.Context()), c.Param("id"), in)
 	if err != nil {
 		apperror.Handle(c, err)
 		return
@@ -69,7 +70,7 @@ func (h *Controller) Update(c *gin.Context) {
 
 // Delete menangani DELETE /api/context-packs/:id.
 func (h *Controller) Delete(c *gin.Context) {
-	if err := h.service.Delete(c.Param("id")); err != nil {
+	if err := h.service.Delete(userctx.Scope(c.Request.Context()), c.Param("id")); err != nil {
 		apperror.Handle(c, err)
 		return
 	}

@@ -12,11 +12,12 @@ const (
 )
 
 // Credential adalah satu baris tabel m_mcp_credentials: pendaftaran klien
-// OAuth dan token login untuk satu server MCP. Satu server = satu akun bersama
-// (tidak terikat user). Secret dan token disimpan terenkripsi (MCP_TOKEN_KEY).
+// OAuth dan token login satu user untuk satu server MCP. Tiap user login ke
+// akunnya sendiri. Secret dan token disimpan terenkripsi (MCP_TOKEN_KEY).
 type Credential struct {
 	ID     string `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	Server string `gorm:"size:100;not null;uniqueIndex"`
+	UserID string `gorm:"size:128;not null;default:'';uniqueIndex:idx_m_mcp_credentials_user_server,priority:1"`
+	Server string `gorm:"size:100;not null;uniqueIndex:idx_m_mcp_credentials_user_server,priority:2"`
 
 	// hasil discovery dan pendaftaran klien (DCR); dibuat ulang bila alamat
 	// login atau redirect berubah
@@ -42,3 +43,20 @@ type Credential struct {
 
 // TableName menetapkan nama tabel. Data master diberi awalan "m_".
 func (Credential) TableName() string { return "m_mcp_credentials" }
+
+// UserServer adalah satu baris tabel m_mcp_servers: server MCP yang ditambahkan
+// seorang user (lewat chat atau API) dan hanya terlihat oleh user itu. Server
+// bawaan untuk semua user ada di mcp.json.
+type UserServer struct {
+	ID       string `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	UserID   string `json:"user_id" gorm:"size:128;not null;uniqueIndex:idx_m_mcp_servers_user_name,priority:1"`
+	Name     string `json:"name" gorm:"size:40;not null;uniqueIndex:idx_m_mcp_servers_user_name,priority:2"`
+	URL      string `json:"url" gorm:"type:text;not null"`
+	Keywords string `json:"keywords" gorm:"type:text"` // daftar kata, JSON array
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TableName menetapkan nama tabel. Data master diberi awalan "m_".
+func (UserServer) TableName() string { return "m_mcp_servers" }

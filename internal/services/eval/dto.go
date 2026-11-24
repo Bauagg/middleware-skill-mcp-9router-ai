@@ -8,10 +8,19 @@ type RunInput struct {
 	// Variants yang dibandingkan: "full", "short", "none". Kosong = full,
 	// short (bila SHORT.md ada), dan none.
 	Variants []string `json:"variants"`
-	// Model yang diuji; kosong = EVAL_TARGET_MODEL.
+	// Model 9Router yang diuji (wajib).
 	Model string `json:"model"`
+	// JudgeModel adalah model penilai; kosong = sama dengan Model.
+	JudgeModel string `json:"judge_model"`
 	// Limit membatasi jumlah pertanyaan yang dipakai (0 = semua).
 	Limit int `json:"limit"`
+	// UserID diisi controller dari header X-User-Id (bukan dari body).
+	UserID string `json:"-"`
+	// RouterKey diisi controller dari header X-Router-Key: eval memakai akun
+	// 9Router pemanggil, bukan key milik middleware.
+	RouterKey string `json:"-"`
+	// RouterURL diisi controller dari header X-Router-URL (alamat 9Router pemanggil).
+	RouterURL string `json:"-"`
 }
 
 // RunStarted adalah respons saat eval mulai berjalan.
@@ -61,6 +70,7 @@ type RunSummary struct {
 // RunListItem adalah satu baris daftar eval.
 type RunListItem struct {
 	RunID        string    `json:"run_id"`
+	UserID       string    `json:"user_id"` // yang menjalankan eval
 	Skill        string    `json:"skill"`
 	SkillVersion string    `json:"skill_version"`
 	Model        string    `json:"model"`

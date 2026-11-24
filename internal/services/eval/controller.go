@@ -6,8 +6,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/Bauagg/middleware-skill-ai/internal/clients"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/apperror"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/response"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/userctx"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/uuidparam"
 )
 
@@ -36,6 +38,21 @@ func (h *Controller) Run(c *gin.Context) {
 		return
 	}
 
+	in.UserID = userctx.From(c.Request.Context())
+	if in.RouterKey = userctx.RouterKeyFromHeader(c); in.RouterKey == "" {
+		apperror.Handle(c, apperror.NewUnauthorized("Key 9Router wajib", response.FieldError{
+			Field: userctx.RouterKeyHeader, Message: "header " + userctx.RouterKeyHeader + " wajib diisi dengan key 9Router milikmu",
+		}))
+		return
+	}
+	base, err := clients.ParseRouterURL(userctx.RouterURLFromHeader(c))
+	if err != nil {
+		apperror.Handle(c, apperror.NewBadRequest("Validasi gagal", response.FieldError{
+			Field: userctx.RouterURLHeader, Message: err.Error(),
+		}))
+		return
+	}
+	in.RouterURL = base
 	started, err := h.service.Start(in)
 	if err != nil {
 		apperror.Handle(c, err)
@@ -53,7 +70,7 @@ func (h *Controller) Get(c *gin.Context) {
 		return
 	}
 
-	sum, err := h.service.Summary(id, c.Query("detail") == "true")
+	sum, err := h.service.Summary(userctx.Scope(c.Request.Context()), id, c.Query("detail") == "true")
 	if err != nil {
 		apperror.Handle(c, err)
 		return
@@ -74,7 +91,7 @@ func (h *Controller) List(c *gin.Context) {
 		limit = n
 	}
 
-	runs, err := h.service.Runs(strings.TrimSpace(c.Query("skill")), limit)
+	runs, err := h.service.Runs(userctx.Scope(c.Request.Context()), strings.TrimSpace(c.Query("skill")), limit)
 	if err != nil {
 		apperror.Handle(c, err)
 		return

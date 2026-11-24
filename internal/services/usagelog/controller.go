@@ -10,6 +10,7 @@ import (
 
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/apperror"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/response"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/userctx"
 )
 
 const (
@@ -41,10 +42,11 @@ func (h *Controller) List(c *gin.Context) {
 	}
 
 	rows, total, err := h.service.List(ListFilter{
-		Model: strings.TrimSpace(c.Query("model")),
-		Skill: strings.TrimSpace(c.Query("skill")),
-		Page:  page,
-		Limit: limit,
+		UserID: logScope(c),
+		Model:  strings.TrimSpace(c.Query("model")),
+		Skill:  strings.TrimSpace(c.Query("skill")),
+		Page:   page,
+		Limit:  limit,
 	})
 	if err != nil {
 		apperror.Handle(c, err)
@@ -62,7 +64,7 @@ func (h *Controller) List(c *gin.Context) {
 // Summary menangani GET /api/usage-logs/summary?from=...&to=...
 // from/to berformat RFC3339 atau YYYY-MM-DD; to tidak ikut dihitung.
 func (h *Controller) Summary(c *gin.Context) {
-	var f SummaryFilter
+	f := SummaryFilter{UserID: logScope(c)}
 	var err error
 
 	if f.From, err = timeQuery(c, "from"); err != nil {
@@ -81,6 +83,15 @@ func (h *Controller) Summary(c *gin.Context) {
 	}
 
 	response.Success(c, result, "Berhasil meringkas pemakaian")
+}
+
+// logScope menentukan log siapa yang dibaca: admin boleh memilih lewat
+// ?user_id= (kosong = semua), user biasa selalu hanya miliknya sendiri.
+func logScope(c *gin.Context) string {
+	if scope := userctx.Scope(c.Request.Context()); scope != "" {
+		return scope
+	}
+	return strings.TrimSpace(c.Query("user_id"))
 }
 
 // intQuery membaca query param angka dengan batas min..max.

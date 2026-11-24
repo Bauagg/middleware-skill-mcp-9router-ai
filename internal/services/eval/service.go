@@ -30,6 +30,7 @@ import (
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/apperror"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/response"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/tokens"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/userctx"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/skillstore"
 )
 
@@ -68,8 +69,8 @@ type Files interface {
 // Store menyimpan hasil eval; Repository memenuhinya.
 type Store interface {
 	Save(row *EvalRun) error
-	ByRun(runID string) ([]EvalRun, error)
-	Runs(skill string, limit int) ([]RunListItem, error)
+	ByRun(userID, runID string) ([]EvalRun, error)
+	Runs(userID, skill string, limit int) ([]RunListItem, error)
 }
 
 // Deps adalah semua yang dibutuhkan Service.
@@ -78,9 +79,7 @@ type Deps struct {
 	Renderer    Renderer
 	Files       Files
 	Store       Store
-	TargetModel string // model yang diuji bila tidak disebut di request
-	JudgeModel  string // model penilai
-	Concurrency int    // berapa pertanyaan diproses bersamaan
+	Concurrency int // berapa pertanyaan diproses bersamaan
 }
 
 // Service menjalankan dan meringkas eval.
@@ -97,11 +96,12 @@ type progress struct {
 
 // job adalah satu pertanyaan x satu varian.
 type job struct {
-	runID, skill, version, model string
-	index                        int
-	c                            Case
-	variant                      string
-	rendered                     *skillstore.Rendered // nil untuk "none"
+	runID, skill, version, model, userID string
+	judgeModel, routerKey, routerURL     string
+	index                                int
+	c                                    Case
+	variant                              string
+	rendered                             *skillstore.Rendered // nil untuk "none"
 }
 
 // NewService membuat service eval.
@@ -138,11 +138,12 @@ func (s *Service) Start(in RunInput) (*RunStarted, error) {
 
 	model := strings.TrimSpace(in.Model)
 	if model == "" {
-		model = s.TargetModel
+		return nil, apperror.NewBadRequest("Validasi gagal",
+			response.FieldError{Field: "model", Message: "model wajib diisi dengan model 9Router milikmu"})
 	}
-	if model == "" || s.JudgeModel == "" {
-		return nil, apperror.NewBadRequest("Model eval belum diatur",
-			response.FieldError{Field: "model", Message: "isi model di body, atau EVAL_TARGET_MODEL dan EVAL_JUDGE_MODEL (atau AI_ROUTER_MODEL) di .env"})
+	judgeModel := strings.TrimSpace(in.JudgeModel)
+	if judgeModel == "" {
+		judgeModel = model
 	}
 
 	rendered := map[string]*skillstore.Rendered{}
@@ -166,7 +167,7 @@ func (s *Service) Start(in RunInput) (*RunStarted, error) {
 	var jobs []job
 	for i, c := range cases {
 		for _, v := range variants {
-			jobs = append(jobs, job{runID: runID, skill: skill, version: version, model: model, index: i, c: c, variant: v, rendered: rendered[v]})
+			jobs = append(jobs, job{runID: runID, userID: in.UserID, routerKey: in.RouterKey, routerURL: in.RouterURL, skill: skill, version: version, model: model, judgeModel: judgeModel, index: i, c: c, variant: v, rendered: rendered[v]})
 		}
 	}
 
@@ -179,7 +180,7 @@ func (s *Service) Start(in RunInput) (*RunStarted, error) {
 	logger.Info("eval dimulai", zap.String("run_id", runID), zap.String("skill", skill), zap.Int("jobs", len(jobs)))
 	return &RunStarted{
 		RunID: runID, Skill: skill, SkillVersion: version, Variants: variants,
-		Cases: len(cases), Jobs: len(jobs), Model: model, JudgeModel: s.JudgeModel,
+		Cases: len(cases), Jobs: len(jobs), Model: model, JudgeModel: judgeModel,
 	}, nil
 }
 
@@ -299,8 +300,8 @@ func (s *Service) run(runID string, jobs []job) {
 // runJob menjawab satu pertanyaan dengan satu varian lalu menilainya.
 func (s *Service) runJob(j job) EvalRun {
 	row := EvalRun{
-		RunID: j.runID, Skill: j.skill, SkillVersion: j.version, Variant: j.variant,
-		Model: j.model, JudgeModel: s.JudgeModel,
+		RunID: j.runID, UserID: j.userID, Skill: j.skill, SkillVersion: j.version, Variant: j.variant,
+		Model: j.model, JudgeModel: j.judgeModel,
 		CaseIndex: j.index, Question: j.c.Question, Criteria: j.c.Criteria,
 	}
 
@@ -311,7 +312,9 @@ func (s *Service) runJob(j job) EvalRun {
 	}
 	messages = append(messages, clients.ChatMessage{Role: "user", Content: j.c.Question})
 
-	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	// eval berjalan di latar belakang dengan akun 9Router milik pemanggil
+	base := userctx.WithRouterKey(userctx.WithRouterURL(context.Background(), j.routerURL), j.routerKey)
+	ctx, cancel := context.WithTimeout(base, callTimeout)
 	defer cancel()
 
 	start := time.Now()
@@ -328,10 +331,10 @@ func (s *Service) runJob(j job) EvalRun {
 		row.PromptTokens, row.CompletionTokens = &pt, &ct
 	}
 
-	jctx, jcancel := context.WithTimeout(context.Background(), callTimeout)
+	jctx, jcancel := context.WithTimeout(base, callTimeout)
 	defer jcancel()
 
-	score, reason, used, err := s.judge(jctx, j.c, ans.Text)
+	score, reason, used, err := s.judge(jctx, j.judgeModel, j.c, ans.Text)
 	row.JudgeTokens = used
 	if err != nil {
 		row.Error = "menilai: " + err.Error()
@@ -343,7 +346,7 @@ func (s *Service) runJob(j job) EvalRun {
 
 // judge meminta model hakim menilai jawaban 0-10. Hakim tidak diberi tahu
 // varian mana yang menjawab, supaya penilaiannya tidak berat sebelah.
-func (s *Service) judge(ctx context.Context, c Case, answer string) (float64, string, int, error) {
+func (s *Service) judge(ctx context.Context, judgeModel string, c Case, answer string) (float64, string, int, error) {
 	prompt := "Pertanyaan:\n" + c.Question +
 		"\n\nKriteria jawaban yang baik:\n" + c.Criteria +
 		"\n\nJawaban yang dinilai:\n<<<\n" + answer + "\n>>>\n\n" +
@@ -355,7 +358,7 @@ func (s *Service) judge(ctx context.Context, c Case, answer string) (float64, st
 		{Role: "user", Content: prompt},
 	}
 
-	out, err := s.LLM.Complete(ctx, s.JudgeModel, messages)
+	out, err := s.LLM.Complete(ctx, judgeModel, messages)
 	if err != nil {
 		return 0, "", 0, err
 	}
@@ -388,8 +391,9 @@ func parseVerdict(text string) (float64, string, error) {
 }
 
 // Summary meringkas satu eval per varian beserta kesimpulannya.
-func (s *Service) Summary(runID string, detail bool) (*RunSummary, error) {
-	rows, err := s.Store.ByRun(runID)
+// userID "" = semua user (admin); selain itu hanya eval milik user itu.
+func (s *Service) Summary(userID, runID string, detail bool) (*RunSummary, error) {
+	rows, err := s.Store.ByRun(userID, runID)
 	if err != nil {
 		logger.Error("baca hasil eval gagal", zap.Error(err))
 		return nil, apperror.NewInternalServerError("Gagal mengambil hasil eval")
@@ -427,8 +431,8 @@ func (s *Service) Summary(runID string, detail bool) (*RunSummary, error) {
 }
 
 // Runs mengambil daftar eval terbaru.
-func (s *Service) Runs(skill string, limit int) ([]RunListItem, error) {
-	rows, err := s.Store.Runs(skill, limit)
+func (s *Service) Runs(userID, skill string, limit int) ([]RunListItem, error) {
+	rows, err := s.Store.Runs(userID, skill, limit)
 	if err != nil {
 		logger.Error("baca daftar eval gagal", zap.Error(err))
 		return nil, apperror.NewInternalServerError("Gagal mengambil daftar eval")

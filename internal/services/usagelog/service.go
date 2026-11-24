@@ -136,6 +136,7 @@ func toModel(e Entry) UsageLog {
 		model = "unknown"
 	}
 	return UsageLog{
+		UserID:          e.UserID,
 		Model:           model,
 		Path:            e.Path,
 		Stream:          e.Stream,

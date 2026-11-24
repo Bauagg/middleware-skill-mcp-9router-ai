@@ -1,9 +1,6 @@
 package mcp
 
-import (
-	"encoding/json"
-	"time"
-)
+import "time"
 
 // FileConfig adalah isi file MCP_CONFIG_PATH (mcp.json).
 type FileConfig struct {
@@ -35,6 +32,7 @@ func (c ServerConfig) IsEnabled() bool { return c.Enabled == nil || *c.Enabled }
 type ServerStatus struct {
 	Name          string     `json:"name"`
 	URL           string     `json:"url"`
+	Own           bool       `json:"own"` // true = ditambahkan user ini; false = bawaan mcp.json
 	State         string     `json:"state"`
 	Error         string     `json:"error,omitempty"`
 	Tools         int        `json:"tools"`
@@ -57,22 +55,32 @@ type ToolInfo struct {
 	Selected    *bool    `json:"selected,omitempty"` // akan dikirim ke model untuk pesan q
 }
 
-// ToolSpec adalah tool yang dikirim ke model: definisi function berformat
-// OpenAI ({"type":"function","function":{...}}).
-type ToolSpec struct {
-	Name       string
-	Server     string
-	Definition json.RawMessage
+// Connection adalah ringkasan login satu user ke satu server MCP (tanpa token).
+type Connection struct {
+	UserID      string     `json:"user_id"`
+	Server      string     `json:"server"`
+	LoggedIn    bool       `json:"logged_in"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	ConnectedAt *time.Time `json:"connected_at,omitempty"`
 }
 
-// CallResult adalah hasil pemanggilan tool untuk diberikan ke model.
-type CallResult struct {
-	Text    string
-	IsError bool
+// AllUsersResult adalah respons GET /api/mcp/admin/servers (khusus admin).
+type AllUsersResult struct {
+	Builtin     []string     `json:"builtin"`      // server bawaan mcp.json (untuk semua user)
+	UserServers []UserServer `json:"user_servers"` // server tambahan milik tiap user
+	Connections []Connection `json:"connections"`  // siapa sudah login ke server mana
+}
+
+// AddServerInput adalah body POST /api/mcp/servers (server milik user).
+type AddServerInput struct {
+	Name     string   `json:"name" binding:"required,max=40"`
+	URL      string   `json:"url" binding:"required,max=2000"`
+	Keywords []string `json:"keywords"`
 }
 
 // oauthState disimpan di Redis selama login berlangsung (state -> server + PKCE).
 type oauthState struct {
+	User     string `json:"user"`
 	Server   string `json:"server"`
 	Verifier string `json:"verifier"`
 }

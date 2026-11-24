@@ -6,6 +6,7 @@ Setiap `POST /v1/chat/completions` dicatat satu baris. Tujuannya menjawab: berap
 
 | Kolom | Isi |
 |---|---|
+| `user_id` | dari header `X-User-Id` (filter `?user_id=` di API) |
 | `model`, `path`, `stream` | dari request |
 | `skill_name`, `skill_score` | skill yang disisipkan dan skornya (NULL bila tanpa skill) |
 | `extra_tokens_est` | perkiraan token dari skill (karakter / 4) |
@@ -62,10 +63,11 @@ cases:
 
 ```bash
 curl -X POST http://localhost:4000/api/evals/runs -H "Content-Type: application/json" \
-  -d '{"skill":"founder-pricing"}'
+  -H "X-API-Key: <API_KEYS>" -H "X-User-Id: admin" -H "X-Router-URL: https://<domain-9router>/v1" -H "X-Router-Key: <KEY 9ROUTER>" \
+  -d '{"skill":"founder-pricing","model":"AI-Crypro"}'
 ```
 
-Opsi: `variants` (bawaan `["full","short","none"]`), `model` (bawaan `EVAL_TARGET_MODEL`), dan `limit` (jumlah soal).
+Wajib: `model` (model 9Router yang diuji) dan header `X-Router-Key` (key 9Router, 401 bila tidak ada). Opsi: `variants` (bawaan `["full","short","none"]`), `judge_model` (bawaan sama dengan `model`), dan `limit` (jumlah soal).
 
 **3. Lihat hasil:**
 

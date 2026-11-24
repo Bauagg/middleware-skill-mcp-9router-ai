@@ -1,12 +1,20 @@
 package proxy
 
-import "github.com/Bauagg/middleware-skill-ai/internal/services/memorynote"
+import (
+	"errors"
+
+	"github.com/Bauagg/middleware-skill-ai/internal/services/memorynote"
+)
+
+// ErrModelRequired dikembalikan Prepare bila body chat tidak membawa "model".
+// Setiap user memakai model 9Router miliknya sendiri, jadi middleware tidak
+// menebak model bawaan.
+var ErrModelRequired = errors.New("field model wajib diisi")
 
 // RequestMeta adalah data dari header request yang dibutuhkan untuk mengenali percakapan.
 type RequestMeta struct {
-	// Authorization dipakai (hanya sebagai hash) supaya percakapan dua
-	// pengguna berbeda tidak bertabrakan.
-	Authorization string
+	// UserID dari header X-User-Id (wajib untuk chat).
+	UserID string
 
 	// ConversationID adalah header X-Conversation-Id dari client (opsional).
 	// Tanpa ini, percakapan dikenali dari pesan user pertamanya.
@@ -18,6 +26,9 @@ type Prepared struct {
 	// Body adalah body yang akan dikirim. Sama persis dengan aslinya bila tidak
 	// ada skill yang disisipkan.
 	Body []byte
+
+	// UserID pengirim request (header X-User-Id).
+	UserID string
 
 	// Model dan Stream dibaca dari body request ("" / false bila tidak ada).
 	Model  string

@@ -10,6 +10,7 @@ import (
 
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/apperror"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/response"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/userctx"
 )
 
 // Controller menangani request HTTP untuk MCP.
@@ -22,9 +23,50 @@ func NewController(service *Service) *Controller {
 	return &Controller{service: service}
 }
 
-// Servers menangani GET /api/mcp/servers.
+func userOf(c *gin.Context) string { return userctx.From(c.Request.Context()) }
+
+// Servers menangani GET /api/mcp/servers: server bawaan + milik user.
 func (h *Controller) Servers(c *gin.Context) {
-	response.Success(c, h.service.Statuses(c.Request.Context()), "Berhasil mengambil server MCP")
+	response.Success(c, h.service.Statuses(c.Request.Context(), userOf(c)), "Berhasil mengambil server MCP")
+}
+
+// AllUsers menangani GET /api/mcp/admin/servers (khusus admin): server MCP
+// tambahan dan status login semua user.
+func (h *Controller) AllUsers(c *gin.Context) {
+	res, err := h.service.AllUsers(c.Request.Context())
+	if err != nil {
+		apperror.Handle(c, err)
+		return
+	}
+	response.Success(c, res, "Berhasil mengambil server MCP semua user")
+}
+
+// AddServer menangani POST /api/mcp/servers: tambah server MCP milik user.
+func (h *Controller) AddServer(c *gin.Context) {
+	var in AddServerInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		apperror.Handle(c, apperror.NewBadRequest("Validasi gagal", apperror.BindingErrors(err)...))
+		return
+	}
+	st, note, err := h.service.AddServer(c.Request.Context(), userOf(c), in.Name, in.URL, in.Keywords)
+	if err != nil {
+		apperror.Handle(c, apperror.NewBadRequest(err.Error()))
+		return
+	}
+	msg := "Server MCP ditambahkan"
+	if note != "" {
+		msg += ": " + note
+	}
+	response.Created(c, st, msg)
+}
+
+// RemoveServer menangani DELETE /api/mcp/servers/:name: hapus server milik user.
+func (h *Controller) RemoveServer(c *gin.Context) {
+	if err := h.service.RemoveServer(c.Request.Context(), userOf(c), c.Param("name")); err != nil {
+		apperror.Handle(c, apperror.NewBadRequest(err.Error()))
+		return
+	}
+	response.Success(c, nil, "Server MCP dihapus")
 }
 
 // Tools menangani GET /api/mcp/tools?q=...&limit=...
@@ -38,15 +80,46 @@ func (h *Controller) Tools(c *gin.Context) {
 		}
 		limit = n
 	}
-	response.Success(c, h.service.Tools(c.Query("q"), limit), "Berhasil mengambil tool MCP")
+	response.Success(c, h.service.Tools(c.Request.Context(), userOf(c), c.Query("q"), limit), "Berhasil mengambil tool MCP")
 }
 
 // Connect menangani GET /api/mcp/servers/:name/connect: mengarahkan browser ke
-// halaman login server. Dengan ?redirect=false, alamatnya dikembalikan sebagai JSON.
+// halaman login server. User dikenali dari header X-User-Id, atau dari link
+// bertanda tangan (u, exp, sig) yang dibagikan chat, karena browser tidak bisa
+// mengirim header. Dengan ?redirect=false, alamatnya dikembalikan sebagai JSON.
 func (h *Controller) Connect(c *gin.Context) {
-	authURL, err := h.service.StartLogin(c.Request.Context(), c.Param("name"))
+	name := c.Param("name")
+	// link bertanda tangan dibuka tanpa X-API-Key/token, jadi header X-User-Id
+	// tidak boleh dipercaya di jalur ini: user hanya dari tanda tangan link
+	var user string
+	if c.Query("sig") != "" {
+		if u := c.Query("u"); h.service.VerifyLink(u, name, c.Query("exp"), c.Query("sig")) {
+			user = u
+		}
+	} else if u := userctx.Resolve(c); userctx.Valid(u) {
+		user = u
+	}
+	if user == "" {
+		msg := "Link login tidak valid atau sudah kedaluwarsa; minta link baru lewat chat."
+		if c.Query("redirect") == "false" {
+			apperror.Handle(c, apperror.NewBadRequest(msg))
+		} else {
+			callbackPage(c, http.StatusBadRequest, "Login tidak bisa dimulai", msg)
+		}
+		return
+	}
+
+	authURL, err := h.service.StartLogin(c.Request.Context(), user, name)
 	if err != nil {
-		apperror.Handle(c, err)
+		if c.Query("redirect") == "false" {
+			apperror.Handle(c, err)
+			return
+		}
+		msg := err.Error()
+		if ae, ok := err.(*apperror.AppError); ok {
+			msg = ae.Message
+		}
+		callbackPage(c, http.StatusBadRequest, "Login tidak bisa dimulai", msg)
 		return
 	}
 	if c.Query("redirect") == "false" {
@@ -83,12 +156,12 @@ func (h *Controller) Callback(c *gin.Context) {
 	if st.State != StateConnected {
 		detail = st.Name + " sudah login, tetapi daftar tool belum bisa diambil (" + st.State + " " + st.Error + ")."
 	}
-	callbackPage(c, http.StatusOK, "Login berhasil", detail+" Tab ini boleh ditutup.")
+	callbackPage(c, http.StatusOK, "Login berhasil", detail+" Tab ini boleh ditutup lalu kembali ke chat.")
 }
 
 // Refresh menangani POST /api/mcp/servers/:name/refresh.
 func (h *Controller) Refresh(c *gin.Context) {
-	st, err := h.service.Refresh(c.Request.Context(), c.Param("name"))
+	st, err := h.service.Refresh(c.Request.Context(), userOf(c), c.Param("name"))
 	if err != nil {
 		apperror.Handle(c, err)
 		return
@@ -98,7 +171,7 @@ func (h *Controller) Refresh(c *gin.Context) {
 
 // Logout menangani DELETE /api/mcp/servers/:name/connection.
 func (h *Controller) Logout(c *gin.Context) {
-	st, err := h.service.Logout(c.Request.Context(), c.Param("name"))
+	st, err := h.service.Logout(c.Request.Context(), userOf(c), c.Param("name"))
 	if err != nil {
 		apperror.Handle(c, err)
 		return

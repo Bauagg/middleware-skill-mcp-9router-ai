@@ -84,12 +84,15 @@ Yang **tidak** gagal terbuka hanya kondisi saat start: PostgreSQL, Redis, dan 9R
 
 ## Siapa memanggil 9Router
 
-| Pemanggil | Key yang dipakai | Kapan |
+Middleware tidak punya alamat, key, atau model 9Router sendiri. Semua panggilan memakai milik user: alamat dari header `X-Router-URL`, key dari `X-Router-Key`, model dari field `model`.
+
+| Pemanggil | Key dan model yang dipakai | Kapan |
 |---|---|---|
-| Proxy (request client) | Key milik **client** (header `Authorization` diteruskan apa adanya) | Setiap chat |
-| Pemilih cadangan | `AI_ROUTER_API_KEY` milik middleware | Hanya saat skor ambigu |
-| Eval | `AI_ROUTER_API_KEY` | Saat eval dijalankan lewat API |
-| Ekstraksi memori | `AI_ROUTER_API_KEY` | Hanya bila pesan berisi kabar hasil |
-| Putaran tool MCP | Key milik **client** | Hanya bila pesan membawa tool MCP; satu request bisa memanggil model beberapa kali |
+| Proxy (request client) | Key **milik user** (header `X-Router-Key`) | Setiap chat |
+| Putaran tool | Key milik user | Hanya bila pesan membawa tool; satu request bisa memanggil model beberapa kali |
+| Buat gambar (`generate_image`) | Key milik user; model gambar dari akun user (`/v1/models/image`) | Saat model memanggil tool gambar |
+| Pemilih cadangan | Key dan model chat milik user | Hanya saat skor ambigu |
+| Ekstraksi memori | Key dan model chat milik user (dibawa ke proses latar belakang) | Hanya bila pesan berisi kabar hasil |
+| Eval | Key dari header `X-Router-Key` pemanggil, model dari body | Saat eval dijalankan lewat API |
 
 Setiap panggilan ke 9Router menambah sekitar 2.100–2.200 token prompt dari sisi 9Router/provider, meskipun prompt dari middleware jauh lebih kecil. Perhitungkan ini saat memperkirakan biaya.

@@ -30,7 +30,7 @@ middleware-skill-ai/
 
 | Folder | Tugas | Tabel |
 |---|---|---|
-| `skillstore/` | Upload zip, daftar skill, menyiapkan teks skill (bersihkan, budget, `SHORT.md`), preview | - (file di `skills/`) |
+| `skillstore/` | Impor skill dari GitHub lewat chat (tool `import_skills_from_github`), export zip, upload zip, daftar skill, menyiapkan teks skill (bersihkan, budget, `SHORT.md`), preview | - (file di `skills/`) |
 | `skillindex/` | Index skill di memori, pemilihan skill (BM25/embedding), keputusan skill aktif, watcher folder | - |
 | `skillcache/` | Cache Redis: skill aktif per percakapan dan hasil seleksi | - (Redis) |
 | `skillfallback/` | Pemilih cadangan: bertanya ke model saat skor ambigu | - |
@@ -39,6 +39,7 @@ middleware-skill-ai/
 | `eval/` | Mengukur kualitas skill (full vs short vs tanpa skill) | `t_eval_runs` |
 | `contextpack/` | Context pack: ringkasan tetap yang selalu disisipkan | `m_context_packs` |
 | `memorynote/` | Catatan memori: ekstraksi, konfirmasi, pencarian teks | `t_memory_notes` |
+| `imagegen/` | Tool bawaan `generate_image`: membuat gambar lewat chat, menyimpan, dan menyajikannya di `/images/<nama>` | `t_generated_images` (file di `images/`) |
 | `mcp/` | Koneksi ke server MCP: daftar server dari `mcp.json`, login OAuth, index dan pemilihan tool, pemanggilan tool | `m_mcp_credentials` |
 
 ## Aturan file di dalam satu service
@@ -67,6 +68,8 @@ Semua panggilan ke layanan luar ada di sini, satu file per layanan. Kalau layana
 | `embedding.go` | Klien embedding umum (`POST /embeddings`), untuk 9Router, Ollama, dan sejenisnya |
 | `mcp.go` | Klien server MCP (Streamable HTTP, memakai SDK resmi `modelcontextprotocol/go-sdk`): daftar tool dan pemanggilan tool |
 | `mcpauth.go` | Discovery OAuth server MCP dan pendaftaran klien otomatis (DCR) |
+| `images.go` | Klien pembuat gambar berformat OpenAI (`POST /images/generations`, b64 atau URL) |
+| `github.go` | Mengunduh arsip repo GitHub publik (untuk impor skill lewat chat) |
 
 ## Folder `pkg/`
 
@@ -74,6 +77,8 @@ Semua panggilan ke layanan luar ada di sini, satu file per layanan. Kalau layana
 |---|---|
 | `response/` | Bentuk respons seragam `{status, message, data, errors}` |
 | `apperror/` | Error aplikasi dan `Handle` (memetakan error ke status HTTP, termasuk 409 untuk data ganda) |
+| `jwtauth/` | Membuat dan memeriksa token login (JWT HS256): access dan refresh |
+| `userctx/` | Identitas user dari header `X-User-Id` (validasi, dibawa di `ctx`, middleware `Require` 400 bila tidak ada) serta alamat dan key 9Router user dari header `X-Router-URL`/`X-Router-Key` (`WithRouterKey`/`RouterKey`) |
 | `uuidparam/` | Middleware yang menolak `:id` bukan UUID dengan 400 |
 | `frontmatter/` | Membaca frontmatter `SKILL.md` (`name`, `description`, `keywords`) |
 | `bm25/` | Tokenizer Indonesia/Inggris (dengan kata umum dan pemotong akhiran ringan) dan skor BM25 |
@@ -83,6 +88,7 @@ Semua panggilan ke layanan luar ada di sini, satu file per layanan. Kalau layana
 | `openai/` | Membaca `usage` dari respons JSON dan SSE |
 | `vector/` | Kemiripan kosinus untuk embedding |
 | `secretbox/` | Enkripsi AES-256-GCM untuk token yang disimpan di database |
+| `llmtool/` | Bentuk tool untuk model (definisi function OpenAI) dan hasilnya, dipakai bersama MCP, pembuat gambar, dan proxy |
 
 ## Pola ketergantungan
 
@@ -103,10 +109,10 @@ Keuntungannya, `proxy` tidak perlu tahu bagaimana catatan disimpan. Bila nanti d
 
 | Awalan | Jenis | Contoh |
 |---|---|---|
-| `t_` | Tabel transaksi (bertambah terus) | `t_usage_logs`, `t_eval_runs`, `t_memory_notes` |
-| `m_` | Tabel master (data acuan yang diatur admin) | `m_context_packs`, `m_mcp_credentials` |
+| `t_` | Tabel transaksi (bertambah terus) | `t_usage_logs`, `t_eval_runs`, `t_memory_notes`, `t_generated_images` |
+| `m_` | Tabel master (data acuan yang diatur admin) | `m_context_packs`, `m_mcp_credentials`, `m_mcp_servers` |
 
-Semua tabel dibuat atau diperbarui otomatis saat server start (`database.Migrate` di `router.go`). Kolom baru di tabel yang sudah berisi data harus diberi `not null` dan `default`, supaya baris lama tidak terisi NULL yang gagal dibaca ke field `int`/`string`.
+Semua tabel data punya kolom **`user_id`** (dari header `X-User-Id`), kecuali skill yang berlaku untuk semua user. Semua tabel dibuat atau diperbarui otomatis saat server start (`database.Migrate` di `router.go`). Kolom baru di tabel yang sudah berisi data harus diberi `not null` dan `default`, supaya baris lama tidak terisi NULL yang gagal dibaca ke field `int`/`string`.
 
 ## Gaya penulisan
 

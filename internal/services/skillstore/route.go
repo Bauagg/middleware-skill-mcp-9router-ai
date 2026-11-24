@@ -7,4 +7,5 @@ func RegisterRoutes(rg *gin.RouterGroup, h *Controller) {
 	rg.GET("", h.List)
 	rg.GET("/preview/:name", h.Preview)
 	rg.POST("/upload", h.Upload)
+	rg.GET("/export", h.Export)
 }

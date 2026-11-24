@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -103,6 +104,34 @@ func (r *Repository) Signature() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// Files mengembalikan path relatif (pemisah "/") semua file di folder skill,
+// terurut. File dan folder berawalan "." (cache embedding) tidak ikut.
+func (r *Repository) Files(name string) ([]string, error) {
+	base := filepath.Join(r.root, name)
+	var out []string
+	err := filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p != base && strings.HasPrefix(d.Name(), ".") {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Type().IsRegular() {
+			rel, err := filepath.Rel(base, p)
+			if err != nil {
+				return err
+			}
+			out = append(out, filepath.ToSlash(rel))
+		}
+		return nil
+	})
+	sort.Strings(out)
+	return out, err
 }
 
 // FileExists memeriksa apakah file ada di dalam folder skill.

@@ -9,6 +9,7 @@ import (
 
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/apperror"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/response"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/userctx"
 )
 
 const (
@@ -47,7 +48,7 @@ func (h *Controller) List(c *gin.Context) {
 		return
 	}
 
-	rows, total, err := h.service.List(ListFilter{Status: status, Query: c.Query("q"), Page: page, Limit: limit})
+	rows, total, err := h.service.List(ListFilter{UserID: userctx.Scope(c.Request.Context()), Status: status, Query: c.Query("q"), Page: page, Limit: limit})
 	if err != nil {
 		apperror.Handle(c, err)
 		return
@@ -69,7 +70,7 @@ func (h *Controller) Match(c *gin.Context) {
 		apperror.Handle(c, apperror.NewBadRequest("Validasi gagal", response.FieldError{Field: "q", Message: "q wajib diisi"}))
 		return
 	}
-	res, err := h.service.Match(c.Request.Context(), q)
+	res, err := h.service.Match(c.Request.Context(), userctx.From(c.Request.Context()), q)
 	if err != nil {
 		apperror.Handle(c, err)
 		return
@@ -79,7 +80,7 @@ func (h *Controller) Match(c *gin.Context) {
 
 // Get menangani GET /api/memory-notes/:id.
 func (h *Controller) Get(c *gin.Context) {
-	row, err := h.service.Get(c.Param("id"))
+	row, err := h.service.Get(userctx.Scope(c.Request.Context()), c.Param("id"))
 	if err != nil {
 		apperror.Handle(c, err)
 		return
@@ -94,7 +95,7 @@ func (h *Controller) Create(c *gin.Context) {
 		apperror.Handle(c, apperror.NewBadRequest("Validasi gagal", apperror.BindingErrors(err)...))
 		return
 	}
-	row, err := h.service.Create(in)
+	row, err := h.service.Create(userctx.From(c.Request.Context()), in)
 	if err != nil {
 		apperror.Handle(c, err)
 		return
@@ -109,7 +110,7 @@ func (h *Controller) Correct(c *gin.Context) {
 		apperror.Handle(c, apperror.NewBadRequest("Validasi gagal", apperror.BindingErrors(err)...))
 		return
 	}
-	row, err := h.service.Correct(c.Param("id"), in)
+	row, err := h.service.Correct(userctx.Scope(c.Request.Context()), c.Param("id"), in)
 	if err != nil {
 		apperror.Handle(c, err)
 		return
@@ -119,7 +120,7 @@ func (h *Controller) Correct(c *gin.Context) {
 
 // Confirm menangani POST /api/memory-notes/:id/confirm.
 func (h *Controller) Confirm(c *gin.Context) {
-	row, err := h.service.Confirm(c.Param("id"))
+	row, err := h.service.Confirm(userctx.Scope(c.Request.Context()), c.Param("id"))
 	if err != nil {
 		apperror.Handle(c, err)
 		return
@@ -129,7 +130,7 @@ func (h *Controller) Confirm(c *gin.Context) {
 
 // Reject menangani POST /api/memory-notes/:id/reject.
 func (h *Controller) Reject(c *gin.Context) {
-	row, err := h.service.Reject(c.Param("id"))
+	row, err := h.service.Reject(userctx.Scope(c.Request.Context()), c.Param("id"))
 	if err != nil {
 		apperror.Handle(c, err)
 		return
@@ -139,7 +140,7 @@ func (h *Controller) Reject(c *gin.Context) {
 
 // Delete menangani DELETE /api/memory-notes/:id.
 func (h *Controller) Delete(c *gin.Context) {
-	if err := h.service.Delete(c.Param("id")); err != nil {
+	if err := h.service.Delete(userctx.Scope(c.Request.Context()), c.Param("id")); err != nil {
 		apperror.Handle(c, err)
 		return
 	}

@@ -20,6 +20,7 @@ type CorrectInput struct {
 
 // ListFilter adalah parameter daftar/cari catatan.
 type ListFilter struct {
+	UserID string
 	Status string // kosong = semua kecuali deleted
 	Query  string // pencarian teks (kosong = urut terbaru)
 	Page   int

@@ -9,6 +9,9 @@ type EvalRun struct {
 	ID    string `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	RunID string `json:"run_id" gorm:"type:uuid;index"`
 
+	// UserID yang menjalankan eval (header X-User-Id).
+	UserID string `json:"user_id" gorm:"size:128;not null;default:'';index"`
+
 	Skill string `json:"skill" gorm:"size:200;index"`
 	// SkillVersion adalah hash isi SKILL.md + SHORT.md saat eval, supaya hasil
 	// sebelum dan sesudah skill diedit bisa dibandingkan.

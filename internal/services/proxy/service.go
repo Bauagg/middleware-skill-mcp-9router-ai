@@ -6,7 +6,11 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,11 +24,12 @@ import (
 
 	"github.com/Bauagg/middleware-skill-ai/internal/clients"
 	"github.com/Bauagg/middleware-skill-ai/internal/logger"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/llmtool"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/modelbudget"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/openai"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/tokens"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/userctx"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/contextpack"
-	"github.com/Bauagg/middleware-skill-ai/internal/services/mcp"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/memorynote"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/skillcache"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/skillindex"
@@ -64,16 +69,51 @@ type Cache interface {
 }
 
 // Upstream adalah tujuan request (9Router); clients.NineRouter memenuhinya.
-// Chat dipakai putaran tool MCP (tanpa streaming, jawaban dibaca utuh).
+// ChatStream dipakai putaran tool (streaming, dirakit middleware).
 type Upstream interface {
 	Forward(w http.ResponseWriter, r *http.Request) clients.Result
-	Chat(ctx context.Context, authorization string, body []byte) (int, []byte, error)
+	ChatStream(ctx context.Context, body []byte) (*http.Response, error)
 }
 
-// Tools memilih dan menjalankan tool MCP; mcp.Service memenuhinya.
+// Tools adalah sumber tool untuk model: memilih tool yang cocok dengan pesan,
+// mengenali tool miliknya, dan menjalankannya. mcp.Service dan
+// imagegen.Service memenuhinya; beberapa sumber digabung dengan ToolSources.
 type Tools interface {
-	Select(ctx context.Context, query string) []mcp.ToolSpec
-	Call(ctx context.Context, name, args string) mcp.CallResult
+	Select(ctx context.Context, query string) []llmtool.Spec
+	Has(ctx context.Context, name string) bool
+	Call(ctx context.Context, name, args string) llmtool.Result
+}
+
+// ToolSources menggabungkan beberapa sumber tool menjadi satu.
+type ToolSources []Tools
+
+// Select mengumpulkan tool yang cocok dari semua sumber.
+func (ts ToolSources) Select(ctx context.Context, query string) []llmtool.Spec {
+	var out []llmtool.Spec
+	for _, t := range ts {
+		out = append(out, t.Select(ctx, query)...)
+	}
+	return out
+}
+
+// Has melaporkan apakah salah satu sumber memiliki tool ini.
+func (ts ToolSources) Has(ctx context.Context, name string) bool {
+	for _, t := range ts {
+		if t.Has(ctx, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// Call menjalankan tool di sumber pemiliknya.
+func (ts ToolSources) Call(ctx context.Context, name, args string) llmtool.Result {
+	for _, t := range ts {
+		if t.Has(ctx, name) {
+			return t.Call(ctx, name, args)
+		}
+	}
+	return llmtool.Result{Text: "tool " + name + " tidak dikenal", IsError: true}
 }
 
 // Recorder mencatat pemakaian satu request; usagelog.Service memenuhinya.
@@ -93,7 +133,7 @@ type ContextPacks interface {
 type Memory interface {
 	Relevant(ctx context.Context, query string) []memorynote.Hit
 	Block(hits []memorynote.Hit) string
-	Observe(userText string, recent []memorynote.Turn)
+	Observe(ctx context.Context, userID, userText string, recent []memorynote.Turn)
 }
 
 // Deps adalah semua yang dibutuhkan Service.
@@ -105,7 +145,7 @@ type Deps struct {
 	Recorder     Recorder     // boleh nil (pencatatan dimatikan)
 	ContextPacks ContextPacks // boleh nil (context pack dimatikan)
 	Memory       Memory       // boleh nil (catatan memori dimatikan)
-	Tools        Tools        // boleh nil (MCP dimatikan)
+	Tools        Tools        // boleh nil (tidak ada tool: MCP dan pembuat gambar mati)
 	ToolMaxSteps int          // putaran panggil-tool maksimal per request
 	Budgets      modelbudget.Budgets
 }
@@ -133,6 +173,7 @@ func (s *Service) RecordUsage(p *Prepared, res clients.Result, elapsed time.Dura
 	}
 
 	e := usagelog.Entry{
+		UserID:          p.UserID,
 		Model:           p.Model,
 		Path:            chatPath,
 		Stream:          p.Stream,
@@ -174,11 +215,11 @@ func (s *Service) RecordUsage(p *Prepared, res clients.Result, elapsed time.Dura
 // Learn dipanggil setelah respons selesai: pesan user diserahkan ke memori
 // untuk diekstrak menjadi catatan usulan bila memuat sinyal hasil. Berjalan di
 // latar belakang, tidak menunda respons.
-func (s *Service) Learn(p *Prepared) {
+func (s *Service) Learn(ctx context.Context, p *Prepared) {
 	if s.Memory == nil || p.Query == "" {
 		return
 	}
-	s.Memory.Observe(p.Query, p.Recent)
+	s.Memory.Observe(ctx, p.UserID, p.Query, p.Recent)
 }
 
 // Prepare menyisipkan konteks tambahan ke awal system prompt pada body
@@ -198,7 +239,7 @@ func (s *Service) Learn(p *Prepared) {
 // Hanya field "messages" yang disentuh; field lain dan field tak dikenal di
 // dalam body maupun di dalam tiap pesan dibiarkan apa adanya.
 func (s *Service) Prepare(ctx context.Context, raw []byte, meta RequestMeta) (*Prepared, error) {
-	p := &Prepared{Body: raw}
+	p := &Prepared{Body: raw, UserID: meta.UserID}
 
 	var body map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &body); err != nil {
@@ -206,6 +247,15 @@ func (s *Service) Prepare(ctx context.Context, raw []byte, meta RequestMeta) (*P
 	}
 	_ = json.Unmarshal(body["model"], &p.Model)
 	_ = json.Unmarshal(body["stream"], &p.Stream)
+
+	// model wajib dari client: setiap user memakai model 9Router miliknya sendiri
+	if strings.TrimSpace(p.Model) == "" {
+		return p, ErrModelRequired
+	}
+	// pemilih cadangan dan tool memakai model yang sama dengan chat user
+	ctx = userctx.WithRouterModel(ctx, p.Model)
+
+	changed := false
 	p.BudgetTokens = s.Budgets.For(p.Model)
 
 	// Standar OpenAI: stream bawaannya false. 9Router justru menjawab SSE bila
@@ -213,6 +263,9 @@ func (s *Service) Prepare(ctx context.Context, raw []byte, meta RequestMeta) (*P
 	// SSE padahal menunggu JSON. Jadi nilainya ditulis eksplisit.
 	if _, ok := body["stream"]; !ok {
 		body["stream"] = json.RawMessage("false")
+		changed = true
+	}
+	if changed {
 		if out, err := json.Marshal(body); err == nil {
 			p.Body = out
 		}
@@ -226,7 +279,7 @@ func (s *Service) Prepare(ctx context.Context, raw []byte, meta RequestMeta) (*P
 	query := lastUserText(messages)
 	p.Query = query
 	p.Recent = recentTurns(messages, recentTurnLimit)
-	convKey := skillcache.ConversationKey(meta.Authorization, meta.ConversationID, firstUserText(messages))
+	convKey := skillcache.ConversationKey(meta.UserID, meta.ConversationID, firstUserText(messages))
 
 	// 1. hasil seleksi (BM25/embedding, pemilih cadangan bila ambigu, atau dari cache)
 	sel, selState := s.selectSkill(ctx, query)
@@ -547,31 +600,46 @@ func prependToContent(raw json.RawMessage, block string) (json.RawMessage, error
 }
 
 // ---------------------------------------------------------------------------
-// putaran tool MCP
+// putaran tool (MCP, gambar, web search, skill)
 // ---------------------------------------------------------------------------
 
 // keepaliveInterval: selama tool berjalan, client streaming dikirimi komentar
 // SSE supaya koneksinya tidak dianggap mati oleh client atau proxy di depan.
 const keepaliveInterval = 10 * time.Second
 
+// maxSSELine membatasi satu baris SSE dari 9Router.
+const maxSSELine = 8 << 20
+
 // toolCall adalah satu permintaan tool dari model.
 type toolCall struct {
 	ID       string `json:"id"`
+	Type     string `json:"type"`
 	Function struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
 }
 
-// RunWithTools menjalankan request yang membawa tool MCP:
+// stepResult adalah jawaban satu putaran model, dirakit dari potongan SSE.
+type stepResult struct {
+	model  string
+	finish string
+	text   strings.Builder
+	calls  []*toolCall
+	usage  *openai.Usage
+}
+
+// RunWithTools menjalankan request yang membawa tool:
 //
-//  1. kirim ke 9Router tanpa streaming;
-//  2. bila model meminta tool, jalankan semua tool itu di server MCP
-//     (bersamaan), tambahkan hasilnya ke percakapan, lalu kirim lagi;
-//  3. ulangi sampai model menjawab tanpa meminta tool, atau batas
+//  1. kirim ke 9Router dengan streaming (supaya koneksi tidak pernah diam:
+//     Cloudflare di depan 9Router memutus koneksi yang diam sekitar 100
+//     detik, dan menulis jawaban panjang seperti satu skill bisa lebih lama);
+//  2. teks jawaban langsung diteruskan ke client streaming per potongan;
+//  3. bila model meminta tool, semua tool dijalankan (bersamaan), hasilnya
+//     ditambahkan ke percakapan, lalu dikirim lagi;
+//  4. diulang sampai model menjawab tanpa meminta tool, atau batas
 //     ToolMaxSteps tercapai (putaran terakhir memakai tool_choice "none");
-//  4. kirim jawaban akhir ke client: JSON biasa, atau SSE bila client
-//     meminta stream (jawaban dikirim sekaligus, bukan per kata).
+//  5. client non-stream menerima JSON utuh di akhir.
 //
 // Pemakaian token semua putaran dijumlahkan.
 func (s *Service) RunWithTools(w http.ResponseWriter, r *http.Request, p *Prepared) clients.Result {
@@ -586,15 +654,16 @@ func (s *Service) RunWithTools(w http.ResponseWriter, r *http.Request, p *Prepar
 	_ = json.Unmarshal(body["messages"], &messages)
 
 	includeUsage := streamIncludeUsage(body["stream_options"])
-	body["stream"] = json.RawMessage("false")
-	delete(body, "stream_options")
+	body["stream"] = json.RawMessage("true")
+	body["stream_options"] = json.RawMessage(`{"include_usage":true}`)
 
-	out := newToolWriter(w, p.Stream)
+	out := newToolWriter(w, p.Stream, p.Model)
 	defer out.stop()
 
 	maxSteps := max(s.ToolMaxSteps, 1)
 	var total openai.Usage
 	hasUsage := false
+	var allText strings.Builder
 
 	for step := 1; ; step++ {
 		last := step > maxSteps
@@ -604,7 +673,18 @@ func (s *Service) RunWithTools(w http.ResponseWriter, r *http.Request, p *Prepar
 		body["messages"], _ = json.Marshal(messages)
 		reqBody, _ := json.Marshal(body)
 
-		status, raw, err := s.Upstream.Chat(ctx, r.Header.Get("Authorization"), reqBody)
+		needSep := allText.Len() > 0
+		onText := func(t string) {
+			if needSep {
+				allText.WriteString("\n\n")
+				out.text("\n\n")
+				needSep = false
+			}
+			allText.WriteString(t)
+			out.text(t)
+		}
+
+		st, status, errBody, err := s.chatStep(ctx, reqBody, onText)
 		p.ToolSteps = step
 		if err != nil {
 			if ctx.Err() != nil {
@@ -613,13 +693,16 @@ func (s *Service) RunWithTools(w http.ResponseWriter, r *http.Request, p *Prepar
 			}
 			logger.Error("putaran tool: 9Router gagal", zap.Error(err))
 			res.Status = http.StatusBadGateway
-			out.fail(res.Status, "9Router tidak dapat dihubungi", "bad_gateway")
+			out.fail(res.Status, "9Router tidak dapat dihubungi: "+err.Error(), "bad_gateway")
+			return res
+		}
+		if status/100 != 2 {
+			res.Status = status
+			out.passthrough(status, errBody)
 			return res
 		}
 
-		sn := openai.NewUsageSniffer("application/json")
-		_, _ = sn.Write(raw)
-		if u := sn.Usage(); u != nil {
+		if u := st.usage; u != nil {
 			hasUsage = true
 			total.PromptTokens += u.PromptTokens
 			total.CompletionTokens += u.CompletionTokens
@@ -631,44 +714,38 @@ func (s *Service) RunWithTools(w http.ResponseWriter, r *http.Request, p *Prepar
 			res.Usage = &u
 		}
 
-		if status/100 != 2 {
-			res.Status = status
-			out.passthrough(status, raw)
-			return res
-		}
-
-		msg, calls, ok := parseChoice(raw)
-		if !ok {
-			res.Status = http.StatusBadGateway
-			out.fail(res.Status, "respons 9Router tidak dikenali", "bad_gateway")
-			return res
-		}
-		if len(calls) == 0 || last {
+		if len(st.calls) == 0 || last {
 			res.Status = http.StatusOK
-			out.final(raw, res.Usage, includeUsage)
+			out.finish(st.model, allText.String(), st.finish, res.Usage, includeUsage)
 			return res
 		}
 
 		// jalankan tool yang diminta, lalu lanjutkan percakapan dengan hasilnya
-		messages = append(messages, msg)
-		names := make([]string, len(calls))
-		for i, c := range calls {
+		msg := map[string]any{"role": "assistant", "content": nil, "tool_calls": st.calls}
+		if t := st.text.String(); t != "" {
+			msg["content"] = t
+		}
+		rawMsg, _ := json.Marshal(msg)
+		messages = append(messages, rawMsg)
+
+		names := make([]string, len(st.calls))
+		for i, c := range st.calls {
 			names[i] = c.Function.Name
 		}
 		out.comment("menjalankan tool: " + strings.Join(names, ", "))
 
-		results := make([]mcp.CallResult, len(calls))
+		results := make([]llmtool.Result, len(st.calls))
 		var wg sync.WaitGroup
-		for i, c := range calls {
+		for i, c := range st.calls {
 			wg.Add(1)
-			go func(i int, c toolCall) {
+			go func(i int, c *toolCall) {
 				defer wg.Done()
 				results[i] = s.Tools.Call(ctx, c.Function.Name, c.Function.Arguments)
 			}(i, c)
 		}
 		wg.Wait()
 
-		for i, c := range calls {
+		for i, c := range st.calls {
 			text := results[i].Text
 			if results[i].IsError {
 				text = "ERROR: " + text
@@ -680,30 +757,150 @@ func (s *Service) RunWithTools(w http.ResponseWriter, r *http.Request, p *Prepar
 	}
 }
 
-// parseChoice membaca pesan jawaban pertama beserta tool yang diminta.
-// msg dikembalikan utuh (termasuk field tambahan seperti reasoning_content)
-// supaya bisa dikirim balik ke model apa adanya.
-func parseChoice(raw []byte) (msg json.RawMessage, calls []toolCall, ok bool) {
-	var resp struct {
-		Choices []struct {
-			Message json.RawMessage `json:"message"`
-		} `json:"choices"`
+// chatStep mengirim satu putaran ke 9Router dengan streaming dan merakit
+// potongan SSE menjadi teks, tool_calls, finish_reason, dan usage. onText
+// dipanggil untuk setiap potongan teks. Bila 9Router menolak, status dan body
+// error dikembalikan (err nil).
+func (s *Service) chatStep(ctx context.Context, body []byte, onText func(string)) (*stepResult, int, []byte, error) {
+	resp, err := s.Upstream.ChatStream(ctx, body)
+	if err != nil {
+		return nil, 0, nil, err
 	}
-	if json.Unmarshal(raw, &resp) != nil || len(resp.Choices) == 0 || len(resp.Choices[0].Message) == 0 {
-		return nil, nil, false
-	}
-	msg = resp.Choices[0].Message
+	defer resp.Body.Close()
 
-	var m struct {
-		ToolCalls []toolCall `json:"tool_calls"`
+	if resp.StatusCode/100 != 2 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, resp.StatusCode, raw, nil
 	}
-	_ = json.Unmarshal(msg, &m)
-	for _, c := range m.ToolCalls {
-		if c.Function.Name != "" {
-			calls = append(calls, c)
+
+	st := &stepResult{}
+	if !strings.Contains(resp.Header.Get("Content-Type"), "event-stream") {
+		// 9Router mengabaikan stream: jawaban utuh berbentuk JSON
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, maxSSELine))
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		return fromJSON(raw, onText)
+	}
+
+	sniff := openai.NewUsageSniffer("text/event-stream")
+	byIndex := map[int]*toolCall{}
+	var order []int
+
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 64<<10), maxSSELine)
+	for sc.Scan() {
+		line := sc.Bytes()
+		_, _ = sniff.Write(append(append([]byte{}, line...), '\n'))
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(line[5:])
+		if string(data) == "[DONE]" {
+			break
+		}
+
+		var ch struct {
+			Model   string          `json:"model"`
+			Error   json.RawMessage `json:"error"`
+			Choices []struct {
+				Delta struct {
+					Content   *string `json:"content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Type     string `json:"type"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal(data, &ch) != nil {
+			continue
+		}
+		if len(ch.Error) > 0 && string(ch.Error) != "null" {
+			return nil, http.StatusBadGateway, append([]byte(`{"error":`), append(ch.Error, '}')...), nil
+		}
+		if ch.Model != "" {
+			st.model = ch.Model
+		}
+		for _, c := range ch.Choices {
+			if c.Delta.Content != nil && *c.Delta.Content != "" {
+				st.text.WriteString(*c.Delta.Content)
+				onText(*c.Delta.Content)
+			}
+			for _, tc := range c.Delta.ToolCalls {
+				call := byIndex[tc.Index]
+				if call == nil {
+					call = &toolCall{Type: "function"}
+					byIndex[tc.Index] = call
+					order = append(order, tc.Index)
+				}
+				if tc.ID != "" {
+					call.ID = tc.ID
+				}
+				if tc.Function.Name != "" {
+					call.Function.Name += tc.Function.Name
+				}
+				call.Function.Arguments += tc.Function.Arguments
+			}
+			if c.FinishReason != nil && *c.FinishReason != "" {
+				st.finish = *c.FinishReason
+			}
 		}
 	}
-	return msg, calls, true
+	if err := sc.Err(); err != nil {
+		return nil, 0, nil, fmt.Errorf("baca stream 9Router: %w", err)
+	}
+
+	for i, idx := range order {
+		c := byIndex[idx]
+		if c.Function.Name == "" {
+			continue
+		}
+		if c.ID == "" {
+			c.ID = fmt.Sprintf("call_%d", i)
+		}
+		st.calls = append(st.calls, c)
+	}
+	st.usage = sniff.Usage()
+	return st, http.StatusOK, nil, nil
+}
+
+// fromJSON merakit stepResult dari jawaban non-stream (bila 9Router
+// mengabaikan permintaan streaming).
+func fromJSON(raw []byte, onText func(string)) (*stepResult, int, []byte, error) {
+	var r struct {
+		Model   string `json:"model"`
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				Content   json.RawMessage `json:"content"`
+				ToolCalls []*toolCall     `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(raw, &r); err != nil || len(r.Choices) == 0 {
+		return nil, http.StatusBadGateway, raw, nil
+	}
+	st := &stepResult{model: r.Model, finish: r.Choices[0].FinishReason}
+	if t := contentText(r.Choices[0].Message.Content); t != "" {
+		st.text.WriteString(t)
+		onText(t)
+	}
+	for _, c := range r.Choices[0].Message.ToolCalls {
+		if c != nil && c.Function.Name != "" {
+			st.calls = append(st.calls, c)
+		}
+	}
+	sn := openai.NewUsageSniffer("application/json")
+	_, _ = sn.Write(raw)
+	st.usage = sn.Usage()
+	return st, http.StatusOK, nil, nil
 }
 
 // streamIncludeUsage membaca stream_options.include_usage dari request.
@@ -715,18 +912,25 @@ func streamIncludeUsage(raw json.RawMessage) bool {
 	return o.IncludeUsage
 }
 
-// toolWriter menulis hasil putaran tool ke client, dalam bentuk JSON biasa
-// atau SSE (bila client meminta stream).
+// toolWriter menulis hasil putaran tool ke client: SSE per potongan (bila
+// client meminta stream) atau JSON utuh di akhir.
 type toolWriter struct {
-	w      http.ResponseWriter
-	stream bool
+	w       http.ResponseWriter
+	stream  bool
+	id      string
+	model   string
+	created int64
 
-	mu   sync.Mutex
-	done chan struct{}
+	mu      sync.Mutex
+	started bool // potongan pertama (berisi role) sudah dikirim
+	done    chan struct{}
 }
 
-func newToolWriter(w http.ResponseWriter, stream bool) *toolWriter {
-	t := &toolWriter{w: w, stream: stream, done: make(chan struct{})}
+func newToolWriter(w http.ResponseWriter, stream bool, model string) *toolWriter {
+	b := make([]byte, 12)
+	_, _ = rand.Read(b)
+	t := &toolWriter{w: w, stream: stream, id: "chatcmpl-mw-" + hex.EncodeToString(b), model: model,
+		created: time.Now().Unix(), done: make(chan struct{})}
 	if !stream {
 		return t
 	}
@@ -778,6 +982,26 @@ func (t *toolWriter) event(v any) {
 	_, _ = io.WriteString(t.w, "data: "+string(b)+"\n\n")
 }
 
+func (t *toolWriter) chunk(choices any) map[string]any {
+	return map[string]any{"id": t.id, "object": "chat.completion.chunk", "created": t.created, "model": t.model, "choices": choices}
+}
+
+// text meneruskan satu potongan teks ke client streaming.
+func (t *toolWriter) text(s string) {
+	if !t.stream || s == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delta := map[string]any{"content": s}
+	if !t.started {
+		delta["role"] = "assistant"
+		t.started = true
+	}
+	t.event(t.chunk([]any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}))
+	t.flush()
+}
+
 // fail mengirim error berformat OpenAI.
 func (t *toolWriter) fail(status int, msg, typ string) {
 	t.mu.Lock()
@@ -804,7 +1028,7 @@ func (t *toolWriter) passthrough(status int, raw []byte) {
 		}
 		_ = json.Unmarshal(raw, &e)
 		if e.Error.Message == "" {
-			e.Error.Message = fmt.Sprintf("9Router menjawab %d", status)
+			e.Error.Message = fmt.Sprintf("9Router menjawab %d: %s", status, strings.TrimSpace(string(raw[:min(len(raw), 200)])))
 		}
 		t.fail(status, e.Error.Message, e.Error.Type)
 		return
@@ -816,18 +1040,29 @@ func (t *toolWriter) passthrough(status int, raw []byte) {
 	_, _ = t.w.Write(raw)
 }
 
-// final mengirim jawaban akhir dengan usage gabungan semua putaran.
-func (t *toolWriter) final(raw []byte, usage *openai.Usage, includeUsage bool) {
-	var resp map[string]json.RawMessage
-	_ = json.Unmarshal(raw, &resp)
-	if usage != nil {
-		resp["usage"], _ = json.Marshal(usageJSON(usage))
+// finish menutup jawaban: SSE (finish_reason, usage, [DONE]) atau JSON utuh
+// berisi seluruh teks dan usage gabungan semua putaran.
+func (t *toolWriter) finish(model, text, finish string, usage *openai.Usage, includeUsage bool) {
+	if model != "" {
+		t.model = model
+	}
+	if finish == "" || finish == "tool_calls" {
+		finish = "stop"
 	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if !t.stream {
+		resp := map[string]any{
+			"id": t.id, "object": "chat.completion", "created": t.created, "model": t.model,
+			"choices": []any{map[string]any{
+				"index": 0, "message": map[string]any{"role": "assistant", "content": text}, "finish_reason": finish,
+			}},
+		}
+		if usage != nil {
+			resp["usage"] = usageJSON(usage)
+		}
 		b, _ := json.Marshal(resp)
 		t.w.Header().Set("Content-Type", "application/json")
 		t.w.WriteHeader(http.StatusOK)
@@ -835,37 +1070,13 @@ func (t *toolWriter) final(raw []byte, usage *openai.Usage, includeUsage bool) {
 		return
 	}
 
-	// ubah jawaban utuh menjadi potongan SSE berformat chat.completion.chunk
-	var head struct {
-		ID      string `json:"id"`
-		Created int64  `json:"created"`
-		Model   string `json:"model"`
-		Choices []struct {
-			FinishReason string `json:"finish_reason"`
-			Message      struct {
-				Content json.RawMessage `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+	if !t.started { // model tidak menulis teks apa pun
+		t.event(t.chunk([]any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": ""}, "finish_reason": nil}}))
+		t.started = true
 	}
-	_ = json.Unmarshal(raw, &head)
-	text, finish := "", "stop"
-	if len(head.Choices) > 0 {
-		text = contentText(head.Choices[0].Message.Content)
-		if fr := head.Choices[0].FinishReason; fr != "" && fr != "tool_calls" {
-			finish = fr
-		}
-	}
-	if head.Created == 0 {
-		head.Created = time.Now().Unix()
-	}
-	chunk := func(choices any) map[string]any {
-		return map[string]any{"id": head.ID, "object": "chat.completion.chunk", "created": head.Created, "model": head.Model, "choices": choices}
-	}
-
-	t.event(chunk([]any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": text}, "finish_reason": nil}}))
-	t.event(chunk([]any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}))
+	t.event(t.chunk([]any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}))
 	if includeUsage && usage != nil {
-		c := chunk([]any{})
+		c := t.chunk([]any{})
 		c["usage"] = usageJSON(usage)
 		t.event(c)
 	}

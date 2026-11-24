@@ -8,6 +8,9 @@ import "time"
 type UsageLog struct {
 	ID string `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 
+	// UserID pengirim request (header X-User-Id).
+	UserID string `json:"user_id" gorm:"size:128;not null;default:'';index"`
+
 	Model  string `json:"model" gorm:"size:200;index"`
 	Path   string `json:"path" gorm:"size:100"`
 	Stream bool   `json:"stream"`

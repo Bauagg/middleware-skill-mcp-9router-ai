@@ -43,3 +43,12 @@ func Migrate(db *gorm.DB, models ...interface{}) error {
 	}
 	return db.AutoMigrate(models...)
 }
+
+// ByUser membatasi query ke data milik satu user. userID "" berarti tanpa
+// batas (admin melihat semua data, lihat userctx.Scope).
+func ByUser(q *gorm.DB, userID string) *gorm.DB {
+	if userID == "" {
+		return q
+	}
+	return q.Where("user_id = ?", userID)
+}

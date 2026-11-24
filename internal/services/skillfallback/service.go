@@ -1,5 +1,5 @@
-// Package skillfallback adalah pemilih skill cadangan: model murah di 9Router
-// diminta memilih satu dari beberapa kandidat, hanya saat skor seleksi ambigu
+// Package skillfallback adalah pemilih skill cadangan: model 9Router milik user
+// (model yang sama dengan chat-nya) diminta memilih satu dari beberapa kandidat, hanya saat skor seleksi ambigu
 // (dua skill bersaing ketat, atau skor teratas sedikit di bawah threshold).
 // Bukan jalur utama: setiap panggilan menambah latensi dan memakai token.
 package skillfallback
@@ -14,6 +14,7 @@ import (
 
 	"github.com/Bauagg/middleware-skill-ai/internal/clients"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/tokens"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/userctx"
 )
 
 // batas panjang teks yang dikirim ke model, supaya panggilan tetap murah
@@ -33,18 +34,19 @@ type Completer interface {
 // Service memilih skill dengan bantuan model.
 type Service struct {
 	llm     Completer
-	model   string
+	enabled bool
 	timeout time.Duration
 }
 
-// NewService membuat pemilih cadangan. model kosong = dimatikan.
-func NewService(llm Completer, model string, timeout time.Duration) *Service {
-	return &Service{llm: llm, model: model, timeout: timeout}
+// NewService membuat pemilih cadangan. Model dan key-nya milik user yang
+// sedang chat (dari context), bukan dari .env.
+func NewService(llm Completer, enabled bool, timeout time.Duration) *Service {
+	return &Service{llm: llm, enabled: enabled, timeout: timeout}
 }
 
 // Enabled melaporkan apakah pemilih cadangan aktif.
 func (s *Service) Enabled() bool {
-	return s != nil && s.llm != nil && s.model != ""
+	return s != nil && s.llm != nil && s.enabled
 }
 
 // Choose meminta model memilih satu kandidat (atau tidak ada) untuk pesan
@@ -64,8 +66,13 @@ func (s *Service) Choose(ctx context.Context, query string, cands []Candidate) (
 		defer cancel()
 	}
 
+	model := userctx.RouterModel(ctx)
+	if model == "" {
+		return Result{}, errors.New("model user tidak diketahui")
+	}
+
 	messages := buildPrompt(query, cands)
-	out, err := s.llm.Complete(ctx, s.model, messages)
+	out, err := s.llm.Complete(ctx, model, messages)
 	if err != nil {
 		return Result{}, err
 	}

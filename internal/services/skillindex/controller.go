@@ -6,8 +6,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/Bauagg/middleware-skill-ai/internal/clients"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/apperror"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/response"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/userctx"
 )
 
 const (
@@ -49,5 +51,19 @@ func (h *Controller) Match(c *gin.Context) {
 	}
 
 	withFallback := c.Query("fallback") == "true"
-	response.Success(c, h.service.Match(c.Request.Context(), q, limit, withFallback), "Berhasil memilih skill")
+	ctx := c.Request.Context()
+	if withFallback {
+		// pemilih cadangan memakai key dan model 9Router milik pemanggil
+		key, model := userctx.RouterKeyFromHeader(c), strings.TrimSpace(c.Query("model"))
+		base, err := clients.ParseRouterURL(userctx.RouterURLFromHeader(c))
+		if key == "" || model == "" || err != nil {
+			apperror.Handle(c, apperror.NewBadRequest("Validasi gagal", response.FieldError{
+				Field: "fallback", Message: "fallback=true butuh header " + userctx.RouterURLHeader + ", " +
+					userctx.RouterKeyHeader + ", dan query model",
+			}))
+			return
+		}
+		ctx = userctx.WithRouterModel(userctx.WithRouterURL(userctx.WithRouterKey(ctx, key), base), model)
+	}
+	response.Success(c, h.service.Match(ctx, q, limit, withFallback), "Berhasil memilih skill")
 }

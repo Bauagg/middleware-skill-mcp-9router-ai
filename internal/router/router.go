@@ -5,11 +5,13 @@
 // catatan memori disisipkan pada `/v1/chat/completions`), API skill di
 // `/api/skills`, log pemakaian di `/api/usage-logs`, eval skill di
 // `/api/evals`, context pack di `/api/context-packs`, catatan memori di
-// `/api/memory-notes`, dan koneksi MCP (Figma, Canva, ...) di `/api/mcp`.
+// `/api/memory-notes`, koneksi MCP (Figma, Canva, ...) di `/api/mcp`, dan
+// gambar hasil generate di `/images/<nama>`.
 package router
 
 import (
 	"context"
+	"crypto/sha256"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -20,9 +22,12 @@ import (
 	"github.com/Bauagg/middleware-skill-ai/internal/config"
 	"github.com/Bauagg/middleware-skill-ai/internal/database"
 	"github.com/Bauagg/middleware-skill-ai/internal/logger"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/jwtauth"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/secretbox"
+	"github.com/Bauagg/middleware-skill-ai/internal/services/auth"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/contextpack"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/eval"
+	"github.com/Bauagg/middleware-skill-ai/internal/services/imagegen"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/mcp"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/memorynote"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/proxy"
@@ -31,6 +36,7 @@ import (
 	"github.com/Bauagg/middleware-skill-ai/internal/services/skillindex"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/skillstore"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/usagelog"
+	"github.com/Bauagg/middleware-skill-ai/internal/services/websearch"
 )
 
 // Register menyiapkan semua route aplikasi dan menyambungkan antar service
@@ -38,12 +44,13 @@ import (
 //
 // Fungsi yang dikembalikan dipanggil saat server dimatikan, setelah request
 // terakhir selesai: menulis sisa log pemakaian ke database.
-func Register(r *gin.Engine, db *gorm.DB, cfg *config.Config) (shutdown func(ctx context.Context)) {
+func Register(r *gin.Engine, db *gorm.DB, cfg *config.Config, tokens *jwtauth.Issuer) (shutdown func(ctx context.Context)) {
 	// tabel transaksi dibuat/diperbarui otomatis saat start
 	if err := database.Migrate(db,
 		&usagelog.UsageLog{}, &eval.EvalRun{},
 		&contextpack.ContextPack{}, &memorynote.MemoryNote{},
-		&mcp.Credential{},
+		&mcp.Credential{}, &mcp.UserServer{}, &imagegen.GeneratedImage{},
+		&auth.User{},
 	); err != nil {
 		logger.Fatal("migrasi database gagal", zap.Error(err))
 	}
@@ -53,14 +60,32 @@ func Register(r *gin.Engine, db *gorm.DB, cfg *config.Config) (shutdown func(ctx
 	if err := noteRepo.Migrate(); err != nil {
 		logger.Fatal("migrasi pencarian catatan memori gagal", zap.Error(err))
 	}
+	// index unik lama dari sebelum ada user_id (nama/kredensial unik global)
+	packRepo := contextpack.NewRepository(db)
+	if err := packRepo.Migrate(); err != nil {
+		logger.Fatal("migrasi context pack gagal", zap.Error(err))
+	}
+	if err := mcp.NewRepository(db, nil).Migrate(); err != nil {
+		logger.Fatal("migrasi kredensial mcp gagal", zap.Error(err))
+	}
 
 	api := r.Group("/api")
+
+	// akun: register/login/refresh untuk user yang tidak datang dari aplikasi
+	// pihak ketiga; akun admin (pemilik aplikasi) dibuat dari ADMIN_EMAIL
+	authService := auth.NewService(auth.NewRepository(db), tokens)
+	adminCtx, adminCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := authService.EnsureAdmin(adminCtx, cfg.Auth.AdminEmail, cfg.Auth.AdminPassword); err != nil {
+		logger.Error("akun admin gagal disiapkan", zap.Error(err))
+	}
+	adminCancel()
+	auth.RegisterRoutes(api.Group("/auth"), auth.NewController(authService))
 	api.GET("/ping", func(c *gin.Context) {
 		c.JSON(200, gin.H{"message": "pong"})
 	})
 
 	// layanan luar: 9Router (proxy + panggilan middleware sendiri) dan Redis
-	nineRouter := clients.NewNineRouter(cfg.Router.URL, cfg.Router.APIKey)
+	nineRouter := clients.NewNineRouter(cfg.Router.AllowPrivate)
 	redis := newRedis(cfg)
 	cache := skillcache.NewService(redis, cfg.Skill.SelectionTTL, cfg.Skill.SessionTTL)
 
@@ -107,15 +132,13 @@ func Register(r *gin.Engine, db *gorm.DB, cfg *config.Config) (shutdown func(ctx
 		Renderer:    skillService,
 		Files:       skillRepo,
 		Store:       eval.NewRepository(db),
-		TargetModel: cfg.Eval.TargetModel,
-		JudgeModel:  cfg.Eval.JudgeModel,
 		Concurrency: cfg.Eval.Concurrency,
 	})
 	eval.RegisterRoutes(api.Group("/evals"), eval.NewController(evalService))
 
 	// memori (Tahap 4): context pack (m_context_packs) selalu disisipkan,
 	// catatan memori (t_memory_notes) hanya yang cocok dengan pesan user
-	packService := contextpack.NewService(contextpack.NewRepository(db), cfg.Memory.ContextPackMaxTokens)
+	packService := contextpack.NewService(packRepo, cfg.Memory.ContextPackMaxTokens)
 	contextpack.RegisterRoutes(api.Group("/context-packs"), contextpack.NewController(packService))
 
 	noteService := memorynote.NewService(noteRepo, nineRouter, memorynote.Options{
@@ -124,24 +147,56 @@ func Register(r *gin.Engine, db *gorm.DB, cfg *config.Config) (shutdown func(ctx
 		MinMatch:           cfg.Memory.MinMatch,
 		LookupTimeout:      cfg.Memory.LookupTimeout,
 		NoteTTL:            cfg.Memory.NoteTTL,
-		ExtractModel:       cfg.Memory.ExtractModel,
+		ExtractEnabled:     cfg.Memory.ExtractEnabled,
 		ExtractTimeout:     cfg.Memory.ExtractTimeout,
 		ExtractConcurrency: cfg.Memory.ExtractConcurrency,
 	})
 	if noteService.ExtractEnabled() {
-		logger.Info("ekstraksi memori aktif", zap.String("model", cfg.Memory.ExtractModel))
+		logger.Info("ekstraksi memori aktif (model dan key milik user yang chat)")
 	} else {
-		logger.Info("MEMORY_EXTRACT_MODEL kosong: ekstraksi memori dimatikan (catatan manual tetap bisa)")
+		logger.Info("MEMORY_EXTRACT_ENABLED=false: ekstraksi memori dimatikan (catatan manual tetap bisa)")
 	}
 	memorynote.RegisterRoutes(api.Group("/memory-notes"), memorynote.NewController(noteService))
 
 	// MCP: middleware menjadi klien MCP (Figma, Canva, ...) karena 9Router tidak bisa
 	mcpService := newMCP(cfg, db, redis)
 	mcp.RegisterRoutes(api.Group("/mcp"), mcp.NewController(mcpService))
+	// pembuat gambar lewat chat: tool generate_image + penyaji /images/<nama>
+	imageService := newImageGen(cfg, db, r, api)
+
+	// sumber tool untuk model: MCP dan pembuat gambar (masing-masing boleh mati)
+	var sources proxy.ToolSources
+	// MCP selalu ikut: server bisa ditambah lewat chat saat berjalan
+	sources = append(sources, mcpService)
+	go mcpService.Run(context.Background())
+	if imageService.Enabled() {
+		sources = append(sources, imageService)
+	}
+	// bantu-sambung lewat chat: status server MCP (mcp.json) + link login
+	sources = append(sources, mcp.NewConnectTool(mcpService))
+
+	// pencarian web lewat SearXNG (tool web_search) + endpoint cek /api/web-search
+	var searcher websearch.Searcher
+	if cfg.WebSearch.URL != "" {
+		searcher = clients.NewSearXNG(cfg.WebSearch.URL)
+		logger.Info("web search aktif", zap.String("url", cfg.WebSearch.URL))
+	} else {
+		logger.Info("WEB_SEARCH_URL kosong: web search dimatikan")
+	}
+	webService := websearch.NewService(searcher, cfg.WebSearch.MaxResults, cfg.WebSearch.Timeout)
+	websearch.RegisterRoutes(api.Group("/web-search"), websearch.NewController(webService))
+	if webService.Enabled() {
+		sources = append(sources, webService)
+	}
+
+	// buat skill baru lewat chat (model menulis isinya)
+	sources = append(sources, skillstore.NewCreateTool(skillService, cfg.App.BaseURL))
+
+	// impor skill dari GitHub lewat chat (selalu aktif)
+	sources = append(sources, skillstore.NewImportTool(skillService, clients.NewGitHub(), cfg.App.BaseURL))
 	var tools proxy.Tools
-	if mcpService.Enabled() {
-		tools = mcpService
-		go mcpService.Run(context.Background())
+	if len(sources) > 0 {
+		tools = sources
 	}
 
 	// proxy ke 9Router: client OpenAI-compatible cukup mengarah ke middleware ini
@@ -180,6 +235,32 @@ func newRedis(cfg *config.Config) *clients.Redis {
 	return rc
 }
 
+// newImageGen menyiapkan pembuat gambar. Model gambar diambil dari akun
+// 9Router user saat dibutuhkan; tool hanya ditawarkan bila akun itu punya.
+func newImageGen(cfg *config.Config, db *gorm.DB, r *gin.Engine, api *gin.RouterGroup) *imagegen.Service {
+	repo, err := imagegen.NewRepository(cfg.Image.Path, db)
+	if err != nil {
+		logger.Fatal("folder gambar tidak bisa dibuat", zap.String("path", cfg.Image.Path), zap.Error(err))
+	}
+	svc := imagegen.NewService(clients.NewImageClient(cfg.Router.AllowPrivate), repo, imagegen.Options{
+		Size:    cfg.Image.Size,
+		BaseURL: cfg.App.BaseURL,
+		Timeout: cfg.Image.Timeout,
+	})
+	imagegen.RegisterRoutes(r, api, imagegen.NewController(svc))
+	return svc
+}
+
+// linkKey menurunkan kunci tanda tangan link login MCP dari MCP_TOKEN_KEY
+// (kosong bila kunci tidak diisi).
+func linkKey(tokenKey string) []byte {
+	if tokenKey == "" {
+		return nil
+	}
+	sum := sha256.Sum256([]byte("mcp-login-link\x00" + tokenKey))
+	return sum[:]
+}
+
 // newMCP membaca daftar server MCP dari MCP_CONFIG_PATH. File tidak ada =
 // MCP dimatikan. Bila ada server aktif, MCP_TOKEN_KEY wajib diisi (token login
 // disimpan terenkripsi); server berhenti bila tidak.
@@ -200,7 +281,9 @@ func newMCP(cfg *config.Config, db *gorm.DB, kv mcp.KV) *mcp.Service {
 			enabled++
 		}
 	}
-	if enabled > 0 {
+	// kunci dipakai bila ada server aktif, dan juga untuk server yang nanti
+	// ditambahkan lewat chat (login OAuth butuh tempat menyimpan token)
+	if enabled > 0 || cfg.MCP.TokenKey != "" {
 		if box, err = secretbox.New(cfg.MCP.TokenKey); err != nil {
 			logger.Fatal("MCP_TOKEN_KEY tidak valid (wajib bila ada server MCP aktif)", zap.Error(err))
 		}
@@ -214,6 +297,7 @@ func newMCP(cfg *config.Config, db *gorm.DB, kv mcp.KV) *mcp.Service {
 		ResultMaxTokens: cfg.MCP.ResultMaxTokens,
 		RefreshInterval: cfg.MCP.RefreshInterval,
 		BaseURL:         cfg.App.BaseURL,
+		LinkKey:         linkKey(cfg.MCP.TokenKey),
 	})
 }
 
@@ -239,13 +323,13 @@ func newEmbedder(cfg *config.Config) skillindex.Embedder {
 	return emb
 }
 
-// newFallback membuat pemilih cadangan bila SKILL_FALLBACK_MODEL diisi; nil
-// berarti dimatikan (skor ambigu diputuskan dari skor saja).
+// newFallback membuat pemilih cadangan; nil berarti dimatikan (skor ambigu
+// diputuskan dari skor saja). Modelnya sama dengan model chat user.
 func newFallback(cfg *config.Config, llm skillfallback.Completer) skillindex.Fallback {
-	if cfg.Skill.FallbackModel == "" {
-		logger.Info("SKILL_FALLBACK_MODEL kosong: pemilih cadangan dimatikan")
+	if !cfg.Skill.FallbackEnabled {
+		logger.Info("SKILL_FALLBACK_ENABLED=false: pemilih cadangan dimatikan")
 		return nil
 	}
-	logger.Info("pemilih cadangan aktif", zap.String("model", cfg.Skill.FallbackModel))
-	return skillfallback.NewService(llm, cfg.Skill.FallbackModel, cfg.Skill.FallbackTimeout)
+	logger.Info("pemilih cadangan aktif (model dan key milik user yang chat)")
+	return skillfallback.NewService(llm, true, cfg.Skill.FallbackTimeout)
 }

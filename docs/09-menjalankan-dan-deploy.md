@@ -5,7 +5,7 @@
 ```bash
 # 1. siapkan env (Linux/macOS: cp)
 copy .env.example .env
-#    isi DB_*, REDIS_*, AI_ROUTER_BASE_URL, AI_ROUTER_API_KEY
+#    isi DB_*, REDIS_*, API_KEYS, JWT_SECRET
 
 # 2. unduh library
 go mod tidy
@@ -101,6 +101,7 @@ Bila NGINX juga berjalan di container, `127.0.0.1` tidak terjangkau dari contain
 |---|---|---|
 | `skills_data` -> `/app/skills` | Skill hasil upload | Semua skill hilang; harus di-upload ulang |
 | `logs_data` -> `/app/logs` | File log aplikasi | Hanya file log yang hilang |
+| `images_data` -> `/app/images` | Gambar hasil `generate_image` | Link gambar lama di riwayat chat jadi rusak |
 
 Data penting lainnya (log pemakaian, eval, context pack, catatan memori) ada di PostgreSQL, bukan di container.
 
@@ -150,4 +151,13 @@ go build -o bin/server ./cmd/server
 | `/connect` Figma: `registration failed with status 403` | Server MCP resmi Figma hanya menerima klien yang disetujui Figma | Lihat [MCP](10-mcp.md#figma-belum-bisa-dipakai-lewat-server-resminya) |
 | Server MCP terus `needs_login` setelah login | Refresh token ditolak, atau `MCP_TOKEN_KEY` diganti | Login ulang lewat `connect_url` |
 | Halaman login MCP kembali ke alamat yang tidak bisa dibuka | `BASE_URL` bukan alamat yang bisa dijangkau browser | Isi `BASE_URL` dengan alamat publik (lewat NGINX), lalu `/connect` lagi |
-| Catatan memori tidak pernah muncul sebagai `proposed` | `MEMORY_EXTRACT_MODEL` kosong, atau pesan tidak berisi kata sinyal hasil | Isi model ekstraksi; cek log aplikasi `ekstraksi memori` |
+| Gambar di jawaban chat tampil rusak | `BASE_URL` tidak bisa dibuka aplikasi chat, atau `/images/*` tidak dibuka di NGINX | Isi `BASE_URL` dengan alamat publik dan buka `/images/*` |
+| Minta gambar tapi model hanya menjawab teks | Akun 9Router user belum punya model gambar (`GET /v1/models/image` kosong), atau pesan tidak memuat kata seperti "gambar"/"logo"/"ilustrasi" | Tambahkan provider gambar di dashboard 9Router akun itu; lihat [Gambar lewat chat](11-gambar.md) |
+| Semua request dijawab **401** `header X-API-Key tidak ada atau salah` | Client belum mengirim `X-API-Key`, atau nilainya tidak ada di `API_KEYS` | Kirim header `X-API-Key` berisi salah satu key di `.env` |
+| Server berhenti saat start: `API_KEYS wajib diisi` | `API_KEYS` kosong atau key kurang dari 32 karakter | Isi dengan `openssl rand -hex 32` |
+| Aplikasi web gagal dengan error CORS | Header kustom tidak diizinkan | Sudah diizinkan: `Authorization`, `X-API-Key`, `X-Router-URL`, `X-Router-Key`, `X-User-Id`, `X-Conversation-Id`. Pastikan memakai versi terbaru. |
+| Chat dijawab **400** `header X-Router-URL wajib berisi alamat 9Router` | Client belum mengirim alamat 9Router user, atau formatnya salah | Kirim header `X-Router-URL`, mis. `https://domain-9router/v1` |
+| Chat dijawab **502** dan log berisi `mengarah ke jaringan internal` | Alamat 9Router menunjuk localhost/IP privat | Pakai alamat publik 9Router; untuk pengembangan lokal set `ROUTER_ALLOW_PRIVATE_NETWORK=true` |
+| Chat dijawab **401** `header X-Router-Key wajib diisi` | Client belum mengirim key 9Router milik user | Kirim header `X-Router-Key` berisi key 9Router user |
+| Chat dijawab **400** `field model wajib diisi` | Body chat tidak membawa `model` | Kirim `model` (mis. `AI-Crypro`) |
+| Catatan memori tidak pernah muncul sebagai `proposed` | `MEMORY_EXTRACT_ENABLED=false`, atau pesan tidak berisi kata sinyal hasil | Set `MEMORY_EXTRACT_ENABLED=true`; cek log aplikasi `ekstraksi memori` |

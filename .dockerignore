@@ -9,8 +9,10 @@
 bin/
 logs/
 skills/
+images/
 docs/
 docker/
+searxng/
 founder-pricing/
 *.md
 Dockerfile

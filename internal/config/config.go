@@ -27,6 +27,21 @@ type Config struct {
 	Eval      EvalConfig
 	Memory    MemoryConfig
 	MCP       MCPConfig
+	Image     ImageConfig
+	WebSearch WebSearchConfig
+	Auth      AuthConfig
+}
+
+// AuthConfig berisi pengaturan akun dan token login (register/login di
+// middleware, untuk user yang tidak datang dari aplikasi pihak ketiga).
+type AuthConfig struct {
+	JWTSecret  string        // JWT_SECRET: kunci tanda tangan token (wajib, >= 32 karakter)
+	AccessTTL  time.Duration // JWT_ACCESS_TTL: umur access token
+	RefreshTTL time.Duration // JWT_REFRESH_TTL: umur refresh token
+	// AdminEmail/AdminPassword: akun admin (pemilik aplikasi) dibuat saat
+	// start bila belum ada. Kosong = tidak membuat admin.
+	AdminEmail    string // ADMIN_EMAIL
+	AdminPassword string // ADMIN_PASSWORD
 }
 
 // AppConfig berisi pengaturan runtime server.
@@ -36,6 +51,9 @@ type AppConfig struct {
 	BaseURL    string
 	GinMode    string // debug | release | test
 	UploadPath string // folder skill (PATH_FILE_UPLOAD), dibuat otomatis saat start
+	// APIKeys adalah secret key aplikasi client (API_KEYS, dipisah koma; wajib).
+	// Dikirim di header X-API-Key pada setiap request.
+	APIKeys []string
 }
 
 // DBConfig berisi kredensial PostgreSQL.
@@ -68,19 +86,14 @@ type RedisConfig struct {
 	Timeout time.Duration // REDIS_TIMEOUT
 }
 
-// RouterConfig berisi pengaturan 9Router.
+// RouterConfig berisi pengaturan koneksi ke 9Router. Alamat, key, dan model
+// tidak ada di sini: middleware hanya alat di depan 9Router, setiap user
+// mengirim alamat (X-Router-URL), key (X-Router-Key), dan model miliknya.
 type RouterConfig struct {
-	// URL adalah alamat dasar 9Router tujuan proxy (AI_ROUTER_BASE_URL, wajib),
-	// mis. https://9router.example.com/v1
-	URL *url.URL
-
-	// APIKey dipakai middleware untuk panggilannya sendiri ke 9Router
-	// (pemilih cadangan dan eval), bukan untuk request client yang diteruskan
-	// (AI_ROUTER_API_KEY, wajib).
-	APIKey string
-
-	// Model bawaan untuk panggilan middleware sendiri (AI_ROUTER_MODEL).
-	Model string
+	// AllowPrivate mengizinkan alamat 9Router di jaringan internal (localhost,
+	// 10.x, 192.168.x, ...). Bawaan false supaya alamat kiriman client tidak
+	// bisa dipakai mengakses layanan internal server (ROUTER_ALLOW_PRIVATE_NETWORK).
+	AllowPrivate bool
 }
 
 // SkillConfig berisi pengaturan pemilihan dan penyisipan skill.
@@ -110,9 +123,9 @@ type SkillConfig struct {
 
 	// --- pemilih cadangan ---
 
-	// FallbackModel adalah model 9Router yang dipanggil hanya bila skor ambigu.
-	// Kosong = pemilih cadangan dimatikan.
-	FallbackModel   string        // SKILL_FALLBACK_MODEL
+	// FallbackEnabled menyalakan pemilih cadangan (hanya dipanggil bila skor
+	// ambigu). Modelnya sama dengan model chat user, dibayar akun user.
+	FallbackEnabled bool          // SKILL_FALLBACK_ENABLED
 	FallbackTimeout time.Duration // SKILL_FALLBACK_TIMEOUT
 
 	// Budgets adalah batas token skill per model.
@@ -130,17 +143,15 @@ type SkillConfig struct {
 // dimatikan (seleksi memakai BM25). Bila diisi, server embedding wajib
 // terjangkau saat start.
 type EmbeddingConfig struct {
-	BaseURL *url.URL      // EMBEDDING_BASE_URL (bawaan: AI_ROUTER_BASE_URL)
-	APIKey  string        // EMBEDDING_API_KEY (bawaan: AI_ROUTER_API_KEY)
+	BaseURL *url.URL      // EMBEDDING_BASE_URL (wajib bila EMBEDDING_MODEL diisi)
+	APIKey  string        // EMBEDDING_API_KEY (key layanan embedding)
 	Model   string        // EMBEDDING_MODEL
 	Timeout time.Duration // EMBEDDING_TIMEOUT: batas waktu embedding pesan per request
 }
 
 // EvalConfig berisi pengaturan eval skill.
 type EvalConfig struct {
-	TargetModel string // EVAL_TARGET_MODEL: model yang diuji (bawaan: AI_ROUTER_MODEL)
-	JudgeModel  string // EVAL_JUDGE_MODEL: model penilai (bawaan: AI_ROUTER_MODEL)
-	Concurrency int    // EVAL_CONCURRENCY: berapa pertanyaan diproses bersamaan
+	Concurrency int // EVAL_CONCURRENCY: berapa pertanyaan diproses bersamaan
 }
 
 // MemoryConfig berisi pengaturan memori (Tahap 4): context pack dan catatan memori.
@@ -152,7 +163,7 @@ type MemoryConfig struct {
 	LookupTimeout        time.Duration // MEMORY_LOOKUP_TIMEOUT: batas waktu pencarian catatan per request
 	NoteTTL              time.Duration // MEMORY_NOTE_TTL: masa berlaku catatan sejak dikonfirmasi (0 = selamanya)
 
-	ExtractModel       string        // MEMORY_EXTRACT_MODEL: model ekstraksi ("" = ekstraksi dimatikan)
+	ExtractEnabled     bool          // MEMORY_EXTRACT_ENABLED: ekstraksi otomatis (model dan key milik user yang chat)
 	ExtractTimeout     time.Duration // MEMORY_EXTRACT_TIMEOUT: batas waktu satu ekstraksi
 	ExtractConcurrency int           // MEMORY_EXTRACT_CONCURRENCY: ekstraksi yang boleh berjalan bersamaan
 }
@@ -170,6 +181,20 @@ type MCPConfig struct {
 	RefreshInterval time.Duration // MCP_REFRESH_INTERVAL: seberapa sering daftar tool diambil ulang (0 = hanya saat start/login)
 }
 
+// ImageConfig berisi pengaturan pembuat gambar lewat chat (tool generate_image).
+type ImageConfig struct {
+	Size    string        // IMAGE_SIZE: ukuran bawaan, mis. 1024x1024
+	Path    string        // IMAGE_PATH: folder penyimpanan gambar
+	Timeout time.Duration // IMAGE_TIMEOUT: batas waktu membuat satu gambar
+}
+
+// WebSearchConfig berisi pengaturan pencarian web lewat SearXNG (tool web_search).
+type WebSearchConfig struct {
+	URL        string        // WEB_SEARCH_URL: alamat SearXNG ("" = web search mati)
+	MaxResults int           // WEB_SEARCH_MAX_RESULTS: hasil per pencarian
+	Timeout    time.Duration // WEB_SEARCH_TIMEOUT: batas waktu satu pencarian
+}
+
 // Load membaca .env (bila ada) lalu menyusun Config dari environment variable.
 func Load() (*Config, error) {
 	// Abaikan error bila .env tidak ada; environment variable tetap dibaca.
@@ -185,12 +210,12 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	embedding, err := loadEmbeddingConfig(router)
+	embedding, err := loadEmbeddingConfig()
 	if err != nil {
 		return nil, err
 	}
 
-	eval, err := loadEvalConfig(router)
+	eval, err := loadEvalConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -203,6 +228,56 @@ func Load() (*Config, error) {
 	mcp, err := loadMCPConfig()
 	if err != nil {
 		return nil, err
+	}
+
+	image, err := loadImageConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	webSearch := WebSearchConfig{URL: strings.TrimSpace(getEnv("WEB_SEARCH_URL", ""))}
+	if webSearch.MaxResults, err = getEnvInt("WEB_SEARCH_MAX_RESULTS", 8); err != nil {
+		return nil, err
+	}
+	if webSearch.Timeout, err = getEnvDuration("WEB_SEARCH_TIMEOUT", 15*time.Second); err != nil {
+		return nil, err
+	}
+	if webSearch.MaxResults < 1 {
+		webSearch.MaxResults = 8
+	}
+
+	var apiKeys []string
+	for _, k := range strings.Split(getEnv("API_KEYS", ""), ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			if len(k) < 32 {
+				return nil, fmt.Errorf("API_KEYS: setiap key minimal 32 karakter (buat dengan: openssl rand -hex 32)")
+			}
+			apiKeys = append(apiKeys, k)
+		}
+	}
+	if len(apiKeys) == 0 {
+		return nil, fmt.Errorf("API_KEYS wajib diisi (secret key aplikasi client, dikirim di header X-API-Key)")
+	}
+
+	auth := AuthConfig{
+		JWTSecret:     strings.TrimSpace(getEnv("JWT_SECRET", "")),
+		AdminEmail:    strings.TrimSpace(getEnv("ADMIN_EMAIL", "")),
+		AdminPassword: getEnv("ADMIN_PASSWORD", ""),
+	}
+	if len(auth.JWTSecret) < 32 {
+		return nil, fmt.Errorf("JWT_SECRET wajib diisi minimal 32 karakter (buat dengan: openssl rand -hex 32)")
+	}
+	if auth.AccessTTL, err = getEnvDuration("JWT_ACCESS_TTL", 15*time.Minute); err != nil {
+		return nil, err
+	}
+	if auth.RefreshTTL, err = getEnvDuration("JWT_REFRESH_TTL", 30*24*time.Hour); err != nil {
+		return nil, err
+	}
+	if auth.AccessTTL <= 0 || auth.RefreshTTL <= auth.AccessTTL {
+		return nil, fmt.Errorf("JWT_ACCESS_TTL harus > 0 dan JWT_REFRESH_TTL harus lebih lama dari JWT_ACCESS_TTL")
+	}
+	if auth.AdminPassword != "" && len(auth.AdminPassword) < 8 {
+		return nil, fmt.Errorf("ADMIN_PASSWORD minimal 8 karakter")
 	}
 
 	redisAddr := strings.TrimSpace(getEnv("REDIS_ADDR", ""))
@@ -225,6 +300,7 @@ func Load() (*Config, error) {
 			BaseURL:    getEnv("BASE_URL", "http://localhost:4000"),
 			GinMode:    getEnv("GIN_MODE", "debug"),
 			UploadPath: getEnv("PATH_FILE_UPLOAD", "skills"),
+			APIKeys:    apiKeys,
 		},
 		DB: DBConfig{
 			Host:     getEnv("DB_HOST", "localhost"),
@@ -251,22 +327,16 @@ func Load() (*Config, error) {
 		Eval:      eval,
 		Memory:    memory,
 		MCP:       mcp,
+		Image:     image,
+		WebSearch: webSearch,
+		Auth:      auth,
 	}, nil
 }
 
-// loadRouterConfig membaca pengaturan AI_ROUTER_*.
+// loadRouterConfig membaca pengaturan koneksi ke 9Router.
 func loadRouterConfig() (RouterConfig, error) {
-	u, err := parseBaseURL("AI_ROUTER_BASE_URL", getEnv("AI_ROUTER_BASE_URL", ""))
-	if err != nil {
-		return RouterConfig{}, err
-	}
-
-	key := strings.TrimSpace(getEnv("AI_ROUTER_API_KEY", ""))
-	if key == "" {
-		return RouterConfig{}, fmt.Errorf("AI_ROUTER_API_KEY wajib diisi (dipakai pemilih cadangan dan eval)")
-	}
-
-	return RouterConfig{URL: u, APIKey: key, Model: strings.TrimSpace(getEnv("AI_ROUTER_MODEL", ""))}, nil
+	allow, err := getEnvBool("ROUTER_ALLOW_PRIVATE_NETWORK", false)
+	return RouterConfig{AllowPrivate: allow}, err
 }
 
 // loadSkillConfig membaca semua pengaturan SKILL_*.
@@ -300,7 +370,9 @@ func loadSkillConfig() (SkillConfig, error) {
 		return c, err
 	}
 
-	c.FallbackModel = strings.TrimSpace(getEnv("SKILL_FALLBACK_MODEL", ""))
+	if c.FallbackEnabled, err = getEnvBool("SKILL_FALLBACK_ENABLED", true); err != nil {
+		return c, err
+	}
 	if c.FallbackTimeout, err = getEnvDuration("SKILL_FALLBACK_TIMEOUT", 5*time.Second); err != nil {
 		return c, err
 	}
@@ -323,14 +395,14 @@ func loadSkillConfig() (SkillConfig, error) {
 	return c, err
 }
 
-// loadEmbeddingConfig membaca pengaturan EMBEDDING_*. Alamat dan key bawaan
-// mengikuti 9Router, jadi cukup isi EMBEDDING_MODEL bila 9Router sudah punya
-// provider embedding; untuk server lain (mis. Ollama) isi juga EMBEDDING_BASE_URL.
-func loadEmbeddingConfig(router RouterConfig) (EmbeddingConfig, error) {
+// loadEmbeddingConfig membaca pengaturan EMBEDDING_*. Alamatnya wajib diisi
+// sendiri (mis. Ollama) karena middleware tidak punya 9Router tetap. Embedding
+// dipakai untuk index skill bersama (bukan per user), jadi key-nya diisi di
+// EMBEDDING_API_KEY bila layanannya butuh key.
+func loadEmbeddingConfig() (EmbeddingConfig, error) {
 	c := EmbeddingConfig{
-		BaseURL: router.URL,
-		APIKey:  strings.TrimSpace(getEnv("EMBEDDING_API_KEY", router.APIKey)),
-		Model:   strings.TrimSpace(getEnv("EMBEDDING_MODEL", "")),
+		APIKey: strings.TrimSpace(getEnv("EMBEDDING_API_KEY", "")),
+		Model:  strings.TrimSpace(getEnv("EMBEDDING_MODEL", "")),
 	}
 
 	if raw := getEnv("EMBEDDING_BASE_URL", ""); raw != "" {
@@ -341,17 +413,19 @@ func loadEmbeddingConfig(router RouterConfig) (EmbeddingConfig, error) {
 		c.BaseURL = u
 	}
 
+	if c.Model != "" && c.BaseURL == nil {
+		return c, fmt.Errorf("EMBEDDING_BASE_URL wajib diisi bila EMBEDDING_MODEL diisi")
+	}
+
 	var err error
 	c.Timeout, err = getEnvDuration("EMBEDDING_TIMEOUT", 2*time.Second)
 	return c, err
 }
 
 // loadEvalConfig membaca pengaturan EVAL_*.
-func loadEvalConfig(router RouterConfig) (EvalConfig, error) {
-	c := EvalConfig{
-		TargetModel: strings.TrimSpace(getEnv("EVAL_TARGET_MODEL", router.Model)),
-		JudgeModel:  strings.TrimSpace(getEnv("EVAL_JUDGE_MODEL", router.Model)),
-	}
+// Model dan key eval dikirim pemanggil (body model, header X-Router-Key).
+func loadEvalConfig() (EvalConfig, error) {
+	var c EvalConfig
 
 	var err error
 	if c.Concurrency, err = getEnvInt("EVAL_CONCURRENCY", 3); err != nil {
@@ -364,7 +438,11 @@ func loadEvalConfig(router RouterConfig) (EvalConfig, error) {
 }
 
 func loadMemoryConfig() (MemoryConfig, error) {
-	c := MemoryConfig{ExtractModel: strings.TrimSpace(getEnv("MEMORY_EXTRACT_MODEL", ""))}
+	var c MemoryConfig
+	var err error
+	if c.ExtractEnabled, err = getEnvBool("MEMORY_EXTRACT_ENABLED", true); err != nil {
+		return c, err
+	}
 
 	ints := []struct {
 		key string
@@ -455,6 +533,23 @@ func loadMCPConfig() (MCPConfig, error) {
 	return c, nil
 }
 
+// Model gambar tidak diatur di sini: diambil dari akun 9Router user.
+func loadImageConfig() (ImageConfig, error) {
+	c := ImageConfig{
+		Size: strings.TrimSpace(getEnv("IMAGE_SIZE", "1024x1024")),
+		Path: strings.TrimSpace(getEnv("IMAGE_PATH", "images")),
+	}
+
+	var err error
+	if c.Timeout, err = getEnvDuration("IMAGE_TIMEOUT", 2*time.Minute); err != nil {
+		return c, err
+	}
+	if c.Timeout <= 0 {
+		c.Timeout = 2 * time.Minute
+	}
+	return c, nil
+}
+
 // DSN menyusun connection string PostgreSQL untuk GORM.
 func (d DBConfig) DSN() string {
 	return fmt.Sprintf(
@@ -521,6 +616,20 @@ func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s harus berupa durasi >= 0 seperti 30s, 45m, atau 1h, bukan %q", key, v)
 	}
 	return d, nil
+}
+
+// getEnvBool membaca env sebagai true/false (juga 1/0, yes/no).
+func getEnvBool(key string, def bool) (bool, error) {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch v {
+	case "":
+		return def, nil
+	case "true", "1", "yes", "on":
+		return true, nil
+	case "false", "0", "no", "off":
+		return false, nil
+	}
+	return false, fmt.Errorf("%s harus true atau false, bukan %q", key, v)
 }
 
 func getEnv(key, def string) string {

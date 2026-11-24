@@ -1,6 +1,6 @@
 # 5. Memori
 
-Ada dua jenis memori. Keduanya **global**: tidak terikat user tertentu, karena memang tidak ada rencana memakai identitas user. Keduanya disimpan di PostgreSQL. Ini berbeda dengan Redis, yang hanya menyimpan cache sementara.
+Ada dua jenis memori. Keduanya **per user** (header `X-User-Id`): context pack dan catatan milik user A tidak pernah muncul di chat user B. Keduanya disimpan di PostgreSQL dengan kolom `user_id`. Ini berbeda dengan Redis, yang hanya menyimpan cache sementara.
 
 | | Context pack | Catatan memori |
 |---|---|---|
@@ -71,7 +71,7 @@ Catatan yang ditolak atau dihapus **tetap disimpan barisnya**. Tujuannya supaya 
 Setelah jawaban chat selesai dikirim ke client:
 
 1. Pesan user terakhir diperiksa. Ekstraksi hanya jalan bila ada **kata sinyal hasil**, misalnya hasil, berhasil, gagal, omzet, laku, laris, naik, turun, untung, rugi, terjual, penjualan, konversi, anjlok, boncos, revenue, sales, worked, failed, ROI, ROAS, CTR. Pesan yang lebih pendek dari 20 karakter dilewati.
-2. Model `MEMORY_EXTRACT_MODEL` (AI-Crypro) membaca pesan itu ditambah sampai 6 pesan sebelumnya sebagai konteks.
+2. Model chat milik user (field `model` request itu, dengan key `X-Router-Key`-nya) membaca pesan itu ditambah sampai 6 pesan sebelumnya sebagai konteks.
 3. Model hanya boleh mencatat hal yang **sudah dicoba dan hasilnya sudah terjadi**, bukan rencana, pertanyaan, atau saran asisten. Maksimal 3 catatan per pesan.
 4. Catatan disimpan berstatus `proposed`.
 
@@ -141,7 +141,7 @@ curl "http://localhost:4000/api/memory-notes/match?q=mau+promo+diskon+50%25+lagi
 
 | Ingin | Atur |
 |---|---|
-| Matikan ekstraksi otomatis (catatan manual tetap jalan) | `MEMORY_EXTRACT_MODEL=` (kosong) |
+| Matikan ekstraksi otomatis (catatan manual tetap jalan) | `MEMORY_EXTRACT_ENABLED=false` |
 | Matikan penyisipan catatan | `MEMORY_MAX_NOTES=0` |
 | Catatan tidak pernah kedaluwarsa | `MEMORY_NOTE_TTL=0` |
 | Matikan context pack | Nonaktifkan semua context pack (`active: false`) |

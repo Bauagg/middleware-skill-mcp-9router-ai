@@ -9,7 +9,7 @@
 //  3. catatan aktif yang cocok dengan pesan user (maks. beberapa) disisipkan
 //     ke prompt sebagai pengingat, bukan larangan.
 //
-// Memori ini global: tidak terikat user mana pun.
+// Catatan milik tiap user (header X-User-Id) dan hanya dipakai di chat user itu.
 package memorynote
 
 import (
@@ -32,6 +32,7 @@ import (
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/apperror"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/bm25"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/tokens"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/userctx"
 )
 
 const (
@@ -81,7 +82,7 @@ type Options struct {
 	LookupTimeout time.Duration // batas waktu pencarian catatan per request
 	NoteTTL       time.Duration // masa berlaku catatan sejak dikonfirmasi (0 = selamanya)
 
-	ExtractModel       string        // model ekstraksi ("" = ekstraksi dimatikan)
+	ExtractEnabled     bool          // ekstraksi otomatis (model dan key milik user yang chat)
 	ExtractTimeout     time.Duration // batas waktu satu ekstraksi
 	ExtractConcurrency int           // ekstraksi yang boleh berjalan bersamaan
 }
@@ -106,7 +107,7 @@ func NewService(repo *Repository, llm Completer, opt Options) *Service {
 
 // ExtractEnabled melaporkan apakah ekstraksi otomatis aktif.
 func (s *Service) ExtractEnabled() bool {
-	return s.llm != nil && s.opt.ExtractModel != ""
+	return s.llm != nil && s.opt.ExtractEnabled
 }
 
 // ---------------------------------------------------------------------------
@@ -136,8 +137,8 @@ func (s *Service) List(f ListFilter) ([]MemoryNote, int64, error) {
 }
 
 // Get mengambil satu catatan (yang sudah dihapus dianggap tidak ada).
-func (s *Service) Get(id string) (*MemoryNote, error) {
-	row, err := s.repo.Get(id)
+func (s *Service) Get(userID, id string) (*MemoryNote, error) {
+	row, err := s.repo.Get(userID, id)
 	if errors.Is(err, gorm.ErrRecordNotFound) || (err == nil && row.Status == StatusDeleted) {
 		return nil, apperror.NewNotFound("Catatan memori tidak ditemukan")
 	}
@@ -145,9 +146,10 @@ func (s *Service) Get(id string) (*MemoryNote, error) {
 }
 
 // Create menyimpan catatan manual; langsung aktif karena ditulis sendiri.
-func (s *Service) Create(in CreateInput) (*MemoryNote, error) {
+func (s *Service) Create(userID string, in CreateInput) (*MemoryNote, error) {
 	now := time.Now()
 	row := &MemoryNote{
+		UserID:       userID,
 		Topic:        clean(in.Topic),
 		Tried:        clean(in.Tried),
 		Result:       clean(in.Result),
@@ -167,28 +169,28 @@ func (s *Service) Create(in CreateInput) (*MemoryNote, error) {
 }
 
 // Confirm mengaktifkan catatan usulan (atau yang pernah ditolak).
-func (s *Service) Confirm(id string) (*MemoryNote, error) {
-	return s.transition(id, StatusActive, StatusProposed, StatusRejected)
+func (s *Service) Confirm(userID, id string) (*MemoryNote, error) {
+	return s.transition(userID, id, StatusActive, StatusProposed, StatusRejected)
 }
 
 // Reject menolak catatan; catatan yang sama tidak akan diusulkan lagi.
-func (s *Service) Reject(id string) (*MemoryNote, error) {
-	return s.transition(id, StatusRejected, StatusProposed, StatusActive, StatusCorrected)
+func (s *Service) Reject(userID, id string) (*MemoryNote, error) {
+	return s.transition(userID, id, StatusRejected, StatusProposed, StatusActive, StatusCorrected)
 }
 
 // Delete menghapus catatan. Barisnya tetap disimpan berstatus deleted supaya
 // ekstraksi tidak mengusulkan catatan yang sama lagi.
-func (s *Service) Delete(id string) error {
-	if _, err := s.Get(id); err != nil {
+func (s *Service) Delete(userID, id string) error {
+	if _, err := s.Get(userID, id); err != nil {
 		return err
 	}
-	return s.repo.Update(id, map[string]any{"status": StatusDeleted})
+	return s.repo.Update(userID, id, map[string]any{"status": StatusDeleted})
 }
 
 // Correct memperbaiki isi catatan. Catatan yang dikoreksi dianggap sudah
 // diperiksa manusia, jadi langsung dipakai (status corrected).
-func (s *Service) Correct(id string, in CorrectInput) (*MemoryNote, error) {
-	if _, err := s.Get(id); err != nil {
+func (s *Service) Correct(userID, id string, in CorrectInput) (*MemoryNote, error) {
+	if _, err := s.Get(userID, id); err != nil {
 		return nil, err
 	}
 
@@ -211,15 +213,15 @@ func (s *Service) Correct(id string, in CorrectInput) (*MemoryNote, error) {
 	fields["status"] = StatusCorrected
 	fields["confirmed_at"] = now
 	fields["expires_at"] = s.expiry(now)
-	if err := s.repo.Update(id, fields); err != nil {
+	if err := s.repo.Update(userID, id, fields); err != nil {
 		return nil, err
 	}
-	return s.Get(id)
+	return s.Get(userID, id)
 }
 
 // transition mengubah status catatan bila status sekarang termasuk from.
-func (s *Service) transition(id, to string, from ...string) (*MemoryNote, error) {
-	row, err := s.Get(id)
+func (s *Service) transition(userID, id, to string, from ...string) (*MemoryNote, error) {
+	row, err := s.Get(userID, id)
 	if err != nil {
 		return nil, err
 	}
@@ -233,16 +235,16 @@ func (s *Service) transition(id, to string, from ...string) (*MemoryNote, error)
 		fields["confirmed_at"] = now
 		fields["expires_at"] = s.expiry(now)
 	}
-	if err := s.repo.Update(id, fields); err != nil {
+	if err := s.repo.Update(userID, id, fields); err != nil {
 		return nil, err
 	}
-	return s.Get(id)
+	return s.Get(userID, id)
 }
 
 // Match menampilkan catatan yang akan disisipkan untuk pesan q (untuk
 // memeriksa memori tanpa mengirim chat).
-func (s *Service) Match(ctx context.Context, q string) (*MatchResult, error) {
-	hits, err := s.search(ctx, q)
+func (s *Service) Match(ctx context.Context, userID, q string) (*MatchResult, error) {
+	hits, err := s.search(ctx, userID, q)
 	if err != nil {
 		logger.Error("cari catatan memori gagal", zap.Error(err))
 		return nil, apperror.NewInternalServerError("Gagal mencari catatan memori")
@@ -259,16 +261,18 @@ func (s *Service) Match(ctx context.Context, q string) (*MatchResult, error) {
 // dipakai proxy
 // ---------------------------------------------------------------------------
 
-// Relevant mengambil catatan yang cocok dengan pesan user untuk disisipkan.
-// Fail-open: bila database lambat atau gagal, request tetap jalan tanpa catatan.
+// Relevant mengambil catatan milik user di ctx (header X-User-Id) yang cocok
+// dengan pesan untuk disisipkan. Fail-open: bila database lambat atau gagal,
+// request tetap jalan tanpa catatan.
 func (s *Service) Relevant(ctx context.Context, query string) []Hit {
-	if s.opt.MaxNotes < 1 {
+	userID := userctx.From(ctx)
+	if s.opt.MaxNotes < 1 || userID == "" {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.opt.LookupTimeout)
 	defer cancel()
 
-	hits, err := s.search(ctx, query)
+	hits, err := s.search(ctx, userID, query)
 	if err != nil {
 		logger.Warn("cari catatan memori gagal, request diteruskan tanpa catatan", zap.Error(err))
 		return nil
@@ -280,13 +284,13 @@ func (s *Service) Relevant(ctx context.Context, query string) []Hit {
 // yang memuat cukup banyak kata pesan. Pencarian prefix bisa terlalu longgar
 // ("naik:*" juga cocok "naikkan"), jadi penghitungan ulang dengan tokenizer
 // yang sama dengan seleksi skill menjadi penentu akhirnya.
-func (s *Service) search(ctx context.Context, query string) ([]Hit, error) {
+func (s *Service) search(ctx context.Context, userID, query string) ([]Hit, error) {
 	terms := queryTerms(query)
 	if len(terms) == 0 {
 		return []Hit{}, nil
 	}
 
-	cands, err := s.repo.Search(ctx, tsQuery(terms), candidateLimit)
+	cands, err := s.repo.Search(ctx, userID, tsQuery(terms), candidateLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -331,20 +335,28 @@ func (s *Service) Block(hits []Hit) string {
 // Observe dipanggil setelah respons chat selesai. Bila pesan user memuat
 // sinyal hasil, ekstraksi dijalankan di latar belakang; tidak pernah menunda
 // request. Pesan yang sama (request diulang) tidak diekstrak dua kali.
-func (s *Service) Observe(userText string, recent []Turn) {
-	if !s.ExtractEnabled() || !hasResultSignal(userText) {
+func (s *Service) Observe(ctx context.Context, userID, userText string, recent []Turn) {
+	if !s.ExtractEnabled() || userID == "" || !hasResultSignal(userText) {
+		return
+	}
+
+	// ekstraksi berjalan setelah request selesai, jadi key 9Router user
+	// dibawa sebagai nilai, bukan lewat context request yang sudah berakhir
+	routerKey, model, routerURL := userctx.RouterKey(ctx), userctx.RouterModel(ctx), userctx.RouterURL(ctx)
+	if routerKey == "" || model == "" || routerURL == "" {
 		return
 	}
 
 	hash := sourceHash(userText)
-	if _, busy := s.inflight.LoadOrStore(hash, struct{}{}); busy {
+	key := userID + "\x00" + hash
+	if _, busy := s.inflight.LoadOrStore(key, struct{}{}); busy {
 		return
 	}
 
 	select {
 	case s.sem <- struct{}{}:
 	default:
-		s.inflight.Delete(hash)
+		s.inflight.Delete(key)
 		logger.Warn("ekstraksi memori dilewati: antrean penuh")
 		return
 	}
@@ -352,21 +364,22 @@ func (s *Service) Observe(userText string, recent []Turn) {
 	go func() {
 		defer func() {
 			<-s.sem
-			s.inflight.Delete(hash)
+			s.inflight.Delete(key)
 			if r := recover(); r != nil {
 				logger.Error("ekstraksi memori panic", zap.Any("panic", r))
 			}
 		}()
-		s.extract(userText, hash, recent)
+		s.extract(routerURL, routerKey, model, userID, userText, hash, recent)
 	}()
 }
 
 // extract memanggil model untuk mengubah pesan user menjadi catatan usulan.
-func (s *Service) extract(userText, hash string, recent []Turn) {
-	ctx, cancel := context.WithTimeout(context.Background(), s.opt.ExtractTimeout)
+func (s *Service) extract(routerURL, routerKey, model, userID, userText, hash string, recent []Turn) {
+	base := userctx.WithRouterKey(userctx.WithRouterURL(context.Background(), routerURL), routerKey)
+	ctx, cancel := context.WithTimeout(base, s.opt.ExtractTimeout)
 	defer cancel()
 
-	seen, err := s.repo.SourceSeen(ctx, hash)
+	seen, err := s.repo.SourceSeen(ctx, userID, hash)
 	if err != nil {
 		logger.Warn("cek sumber catatan gagal", zap.Error(err))
 		return
@@ -376,9 +389,9 @@ func (s *Service) extract(userText, hash string, recent []Turn) {
 	}
 
 	start := time.Now()
-	resp, err := s.llm.Complete(ctx, s.opt.ExtractModel, extractPrompt(userText, recent))
+	resp, err := s.llm.Complete(ctx, model, extractPrompt(userText, recent))
 	if err != nil {
-		logger.Warn("ekstraksi memori gagal", zap.String("model", s.opt.ExtractModel), zap.Error(err))
+		logger.Warn("ekstraksi memori gagal", zap.String("model", model), zap.Error(err))
 		return
 	}
 
@@ -392,6 +405,7 @@ func (s *Service) extract(userText, hash string, recent []Turn) {
 	excerpt := clip(userText, excerptRunes)
 	for _, it := range items {
 		rows = append(rows, MemoryNote{
+			UserID:        userID,
 			Topic:         it.Topic,
 			Tried:         it.Tried,
 			Result:        it.Result,
@@ -402,7 +416,7 @@ func (s *Service) extract(userText, hash string, recent []Turn) {
 			SourceExcerpt: excerpt,
 			SourceHash:    hash,
 			NoteHash:      noteHash(it.Topic, it.Tried, it.Result),
-			ExtractModel:  s.opt.ExtractModel,
+			ExtractModel:  model,
 		})
 	}
 
