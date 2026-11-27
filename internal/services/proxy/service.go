@@ -24,6 +24,7 @@ import (
 
 	"github.com/Bauagg/middleware-skill-ai/internal/clients"
 	"github.com/Bauagg/middleware-skill-ai/internal/logger"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/attachment"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/llmtool"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/modelbudget"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/openai"
@@ -136,6 +137,14 @@ type Memory interface {
 	Observe(ctx context.Context, userID, userText string, recent []memorynote.Turn)
 }
 
+// Fallback menjawab chat dengan akun AI milik user (Gemini, API kompatibel
+// OpenAI, ...) bila 9Router-nya tidak bisa dipakai (kuota habis, error,
+// tidak terjangkau); aiaccount.Service memenuhinya.
+type Fallback interface {
+	CanChat(ctx context.Context) bool
+	Chat(ctx context.Context, messages []clients.ChatMessage) (text, model string, err error)
+}
+
 // Deps adalah semua yang dibutuhkan Service.
 type Deps struct {
 	Selector     Selector
@@ -146,6 +155,7 @@ type Deps struct {
 	ContextPacks ContextPacks // boleh nil (context pack dimatikan)
 	Memory       Memory       // boleh nil (catatan memori dimatikan)
 	Tools        Tools        // boleh nil (tidak ada tool: MCP dan pembuat gambar mati)
+	Fallback     Fallback     // boleh nil (tanpa cadangan saat 9Router gagal)
 	ToolMaxSteps int          // putaran panggil-tool maksimal per request
 	Budgets      modelbudget.Budgets
 }
@@ -164,6 +174,98 @@ func NewService(deps Deps) *Service {
 // mengembalikan hasil pengamatan (status, token, dan apakah client memutus koneksi).
 func (s *Service) Forward(w http.ResponseWriter, r *http.Request) clients.Result {
 	return s.Upstream.Forward(w, r)
+}
+
+// ForwardChat meneruskan chat tanpa tool ke 9Router seperti Forward. Bila
+// 9Router gagal karena masalah di sisinya (kuota habis, error, tidak
+// terjangkau) dan user punya akun AI yang bisa menjawab, respons gagal itu
+// ditahan dan jawabannya diambil dari akun AI user.
+func (s *Service) ForwardChat(w http.ResponseWriter, r *http.Request, p *Prepared) clients.Result {
+	if s.Fallback == nil {
+		return s.Upstream.Forward(w, r)
+	}
+	ctx := r.Context()
+	res := s.Upstream.Forward(w, r.WithContext(clients.WithFallback(ctx, func(status int) bool {
+		return s.canFallback(ctx, status)
+	})))
+	if !res.Fallback {
+		return res
+	}
+
+	var body struct {
+		Messages []json.RawMessage `json:"messages"`
+	}
+	_ = json.Unmarshal(p.Body, &body)
+	out := newToolWriter(w, p.Stream, p.Model)
+	defer out.stop()
+	text, model, err := s.fallbackChat(ctx, out, body.Messages, res.Status, res.UpstreamError)
+	if err != nil {
+		if ctx.Err() != nil {
+			return clients.Result{Aborted: true}
+		}
+		out.fail(res.Status, err.Error(), "upstream_error")
+		return clients.Result{Status: res.Status}
+	}
+	out.text(text)
+	out.finish(model, text, "stop", nil, false)
+	return clients.Result{Status: http.StatusOK}
+}
+
+// canFallback melaporkan apakah kegagalan 9Router dengan status ini dijawab
+// akun AI user: masalah di sisi 9Router/provider-nya (key/kuota ditolak,
+// limit, error server, tidak terjangkau), bukan request yang salah (400).
+func (s *Service) canFallback(ctx context.Context, status int) bool {
+	if s.Fallback == nil {
+		return false
+	}
+	switch {
+	case status == http.StatusUnauthorized, status == http.StatusPaymentRequired, status == http.StatusForbidden,
+		status == http.StatusTooManyRequests, status >= 500:
+		return s.Fallback.CanChat(ctx)
+	}
+	return false
+}
+
+// fallbackChat menjawab percakapan dengan akun AI user setelah 9Router gagal.
+// Bila akun AI juga gagal, error-nya memuat kedua alasan.
+func (s *Service) fallbackChat(ctx context.Context, out *toolWriter, messages []json.RawMessage, status int, upstream string) (string, string, error) {
+	logger.Warn("9Router gagal, chat dijawab akun AI user", zap.Int("status", status), zap.String("error", clipText(upstream, 300)))
+	out.comment("9Router gagal; menjawab dengan akun AI")
+	text, model, err := s.Fallback.Chat(ctx, chatMessages(messages))
+	if err != nil {
+		logger.Warn("akun AI juga gagal menjawab chat", zap.Error(err))
+		return "", "", fmt.Errorf("9Router gagal (%d): %s; akun AI juga gagal: %w", status, upstream, err)
+	}
+	return text, model, nil
+}
+
+// chatMessages mengubah pesan berformat OpenAI menjadi teks per peran.
+// Permintaan tool dari model ditulis sebagai teks, karena akun AI cadangan
+// tidak menjalankan tool.
+func chatMessages(raw []json.RawMessage) []clients.ChatMessage {
+	out := make([]clients.ChatMessage, 0, len(raw))
+	for _, r := range raw {
+		var m struct {
+			Role      string          `json:"role"`
+			Content   json.RawMessage `json:"content"`
+			ToolCalls []toolCall      `json:"tool_calls"`
+		}
+		if json.Unmarshal(r, &m) != nil {
+			continue
+		}
+		text := contentText(m.Content)
+		if text == "" && len(m.ToolCalls) > 0 {
+			names := make([]string, len(m.ToolCalls))
+			for i, c := range m.ToolCalls {
+				names[i] = c.Function.Name
+			}
+			text = "(memanggil tool: " + strings.Join(names, ", ") + ")"
+		}
+		if text != "" {
+			out = append(out, clients.ChatMessage{Role: m.Role, Content: text})
+		}
+	}
+	return out
 }
 
 // RecordUsage mencatat satu request chat completions yang sudah selesai.
@@ -457,7 +559,7 @@ func roleOf(m map[string]json.RawMessage) string {
 func lastUserText(messages []map[string]json.RawMessage) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		if roleOf(messages[i]) == "user" {
-			return strings.TrimSpace(contentText(messages[i]["content"]))
+			return strings.TrimSpace(typedText(messages[i]["content"]))
 		}
 	}
 	return ""
@@ -480,7 +582,7 @@ func recentTurns(messages []map[string]json.RawMessage, n int) []memorynote.Turn
 		if role != "user" && role != "assistant" {
 			continue
 		}
-		if text := strings.TrimSpace(contentText(messages[i]["content"])); text != "" {
+		if text := strings.TrimSpace(typedText(messages[i]["content"])); text != "" {
 			turns = append(turns, memorynote.Turn{Role: role, Text: text})
 		}
 	}
@@ -499,12 +601,20 @@ func toolQuery(messages []map[string]json.RawMessage) string {
 	var parts []string
 	for i := len(messages) - 1; i >= 0 && len(parts) < 2; i-- {
 		if roleOf(messages[i]) == "user" {
-			if t := strings.TrimSpace(contentText(messages[i]["content"])); t != "" {
+			if t := strings.TrimSpace(typedText(messages[i]["content"])); t != "" {
 				parts = append(parts, t)
 			}
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+// clipText memotong s menjadi paling banyak n karakter.
+func clipText(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n]) + "..."
+	}
+	return s
 }
 
 // hasClientTools melaporkan apakah client sudah membawa tool sendiri.
@@ -522,10 +632,30 @@ func hasClientTools(body map[string]json.RawMessage) bool {
 func firstUserText(messages []map[string]json.RawMessage) string {
 	for _, m := range messages {
 		if roleOf(m) == "user" {
-			return strings.TrimSpace(contentText(m["content"]))
+			return strings.TrimSpace(typedText(m["content"]))
 		}
 	}
 	return ""
+}
+
+// typedText seperti contentText tetapi tanpa isi file lampiran (lihat
+// attachment.Expand): skill, tool, dan memori dipilih dari teks yang diketik
+// user, bukan dari isi dokumen yang dilampirkan.
+func typedText(raw json.RawMessage) string {
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) != nil {
+		return contentText(raw)
+	}
+	var texts []string
+	for _, p := range parts {
+		if (p.Type == "text" || p.Type == "") && p.Text != "" && !strings.HasPrefix(p.Text, attachment.Marker) {
+			texts = append(texts, p.Text)
+		}
+	}
+	return strings.Join(texts, "\n")
 }
 
 // contentText membaca content yang bisa berupa string atau array bagian
@@ -686,6 +816,31 @@ func (s *Service) RunWithTools(w http.ResponseWriter, r *http.Request, p *Prepar
 
 		st, status, errBody, err := s.chatStep(ctx, reqBody, onText)
 		p.ToolSteps = step
+		if err != nil && ctx.Err() == nil {
+			status = http.StatusBadGateway
+		}
+		if (err != nil || status/100 != 2) && ctx.Err() == nil && s.canFallback(ctx, status) {
+			upstream := ""
+			if err != nil {
+				upstream = err.Error()
+			} else {
+				upstream = errorMessage(errBody)
+			}
+			text, model, ferr := s.fallbackChat(ctx, out, messages, status, upstream)
+			if ferr == nil {
+				onText(text)
+				res.Status = http.StatusOK
+				out.finish(model, allText.String(), "stop", res.Usage, includeUsage)
+				return res
+			}
+			if ctx.Err() != nil {
+				res.Aborted = true
+				return res
+			}
+			res.Status = status
+			out.fail(status, ferr.Error(), "upstream_error")
+			return res
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				res.Aborted = true
@@ -748,6 +903,9 @@ func (s *Service) RunWithTools(w http.ResponseWriter, r *http.Request, p *Prepar
 		for i, c := range st.calls {
 			text := results[i].Text
 			if results[i].IsError {
+				// tanpa argumen: bisa memuat data rahasia milik tool MCP lain
+				logger.Warn("tool chat gagal", zap.String("tool", c.Function.Name), zap.Int("step", step),
+					zap.String("error", clipText(text, 300)))
 				text = "ERROR: " + text
 			}
 			m, _ := json.Marshal(map[string]string{"role": "tool", "tool_call_id": c.ID, "content": text})
@@ -869,6 +1027,19 @@ func (s *Service) chatStep(ctx context.Context, body []byte, onText func(string)
 	}
 	st.usage = sniff.Usage()
 	return st, http.StatusOK, nil, nil
+}
+
+// errorMessage mengambil pesan dari body error berformat OpenAI.
+func errorMessage(raw []byte) string {
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &e) == nil && e.Error.Message != "" {
+		return e.Error.Message
+	}
+	return clipText(strings.TrimSpace(string(raw)), 300)
 }
 
 // fromJSON merakit stepResult dari jawaban non-stream (bila 9Router

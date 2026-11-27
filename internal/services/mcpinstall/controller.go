@@ -178,9 +178,34 @@ func (h *Controller) SaveEnv(c *gin.Context) {
 		envPage(c, http.StatusNotFound, envData{Title: "Tidak ditemukan", Detail: "Pemasangan MCP tidak ditemukan untuk akun ini."})
 		return
 	}
-	values := map[string]string{}
+	// koneksi database: user menjelaskan dengan kata-kata sendiri, middleware
+	// menyusun alamat koneksinya (DSN). Bila belum lengkap, form ditampilkan
+	// lagi beserta teksnya (halaman ini tidak di-cache).
+	values, texts := map[string]string{}, map[string]string{}
+	var problems, summaries []string
 	for _, k := range v.EnvKeys {
-		values[k] = c.PostForm(k)
+		val := strings.TrimSpace(c.PostForm(k))
+		texts[k] = val // ditampilkan lagi bila ada isian lain yang belum lengkap
+		if val == "" || !isConnKey(k) {
+			values[k] = val
+			continue
+		}
+		conn, summary, err := buildConn(k, val)
+		if err != nil {
+			problems = append(problems, v.EnvGuide[k].Label+": "+err.Error())
+			continue
+		}
+		values[k] = conn
+		summaries = append(summaries, summary)
+	}
+	if len(problems) > 0 {
+		d := formData(v, c.Request.URL.RawQuery, "")
+		d.Error = strings.Join(problems, ". ") + ". Lengkapi penjelasannya lalu simpan lagi."
+		for i := range d.Fields {
+			d.Fields[i].Text = texts[d.Fields[i].Key]
+		}
+		envPage(c, http.StatusBadRequest, d)
+		return
 	}
 	v, err = h.service.SetEnv(c.Request.Context(), user, c.Param("id"), values)
 	if err != nil {
@@ -196,27 +221,35 @@ func (h *Controller) SaveEnv(c *gin.Context) {
 	case v.ReviewedAt != nil || v.Mine != nil:
 		note = "Tersimpan. Server sedang dijalankan (bisa beberapa menit). Kembali ke chat."
 	}
+	if len(summaries) > 0 {
+		note = "Database: " + strings.Join(summaries, "; ") + ". " + note
+	}
 	envPage(c, http.StatusOK, formData(v, c.Request.URL.RawQuery, note))
 }
 
 type envField struct {
-	Key string
-	Set bool
+	Key, Label, Help, Example string
+	Set                       bool
+	// Multiline: isian panjang (sertifikat, kubeconfig, penjelasan database):
+	// kotak lebih tinggi dan tombol unggah file
+	Multiline bool
+	Text      string // isian yang ditampilkan lagi saat belum lengkap
 }
 
 type envData struct {
-	Title, Detail, Note, Action, Name, Repo string
-	Fields                                  []envField
+	Title, Detail, Note, Error, Action, Name, Repo string
+	Fields                                         []envField
 }
 
 func formData(v *View, rawQuery, note string) envData {
-	d := envData{Title: "Data rahasia MCP " + v.Name, Name: v.Name, Repo: v.RepoURL, Note: note, Action: "?" + rawQuery}
+	d := envData{Title: "Data akses MCP " + v.Name, Name: v.Name, Repo: v.RepoURL, Note: note, Action: "?" + rawQuery}
 	set := map[string]bool{}
 	for _, k := range v.EnvSet {
 		set[k] = true
 	}
 	for _, k := range v.EnvKeys {
-		d.Fields = append(d.Fields, envField{Key: k, Set: set[k]})
+		g := v.EnvGuide[k]
+		d.Fields = append(d.Fields, envField{Key: k, Label: g.Label, Help: g.Help, Example: g.Example, Set: set[k], Multiline: g.Multiline})
 	}
 	return d
 }
@@ -224,17 +257,36 @@ func formData(v *View, rawQuery, note string) envData {
 var envTmpl = template.Must(template.New("env").Parse(`<!doctype html>
 <html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer"><title>{{.Title}}</title>
-<style>body{font-family:system-ui,sans-serif;max-width:560px;margin:40px auto;padding:0 16px;color:#222}
-label{display:block;margin:14px 0 4px;font-weight:600}input{width:100%;padding:8px;box-sizing:border-box;font-family:monospace}
-button{margin-top:18px;padding:10px 18px}small{color:#666}.note{background:#eef7ee;padding:10px;border-radius:6px}</style></head>
+<style>body{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;color:#222;line-height:1.45}
+.field{margin:22px 0}label{display:block;margin-bottom:4px;font-weight:600}
+textarea{width:100%;padding:9px;box-sizing:border-box;font:inherit;border:1px solid #bbb;border-radius:6px;resize:vertical}
+textarea.multi{min-height:130px;font-family:ui-monospace,monospace;font-size:.9em}textarea::placeholder{color:#999}
+.help{color:#555;font-size:.92em;margin:0 0 6px}.upload{font-size:.9em;margin-top:6px}
+button{margin-top:20px;padding:10px 20px;font:inherit;border-radius:6px;border:0;background:#5b3df5;color:#fff;cursor:pointer}
+small{color:#666}.note{background:#eef7ee;padding:10px 12px;border-radius:6px}.error{background:#fdecec;color:#8a1f1f;padding:10px 12px;border-radius:6px}</style></head>
 <body><h2>{{.Title}}</h2>
 {{if .Detail}}<p>{{.Detail}}</p>{{end}}
 {{if .Note}}<p class="note">{{.Note}}</p>{{end}}
-{{if .Fields}}<p><small>Repo: {{.Repo}}. Nilai disimpan terenkripsi dan tidak pernah ditampilkan lagi. Kosongkan kolom yang tidak ingin diubah.</small></p>
+{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+{{if .Fields}}<p><small>Isi dengan kata-katamu sendiri mengikuti contoh samar di dalam kotak. Disimpan terenkripsi dan tidak pernah
+ditampilkan lagi. Kosongkan isian yang tidak ingin diubah.</small></p>
 <form method="post" action="{{.Action}}" autocomplete="off">
-{{range .Fields}}<label for="{{.Key}}">{{.Key}}{{if .Set}} <small>(sudah diisi)</small>{{end}}</label>
-<input type="password" id="{{.Key}}" name="{{.Key}}" autocomplete="new-password">
-{{end}}<button type="submit">Simpan</button></form>{{end}}
+{{range .Fields}}<div class="field"><label for="{{.Key}}">{{.Label}}{{if .Set}} <small>(sudah diisi)</small>{{end}}</label>
+{{if .Help}}<p class="help">{{.Help}}</p>{{end}}
+<textarea id="{{.Key}}" name="{{.Key}}" spellcheck="false" autocomplete="off" rows="{{if .Multiline}}6{{else}}2{{end}}"{{if .Multiline}} class="multi"{{end}} placeholder="{{.Example}}">{{.Text}}</textarea>
+{{if .Multiline}}<div class="upload">atau unggah file: <input type="file" data-target="{{.Key}}"></div>{{end}}</div>
+{{end}}<button type="submit">Simpan</button></form>
+<script>
+document.querySelectorAll('input[type=file][data-target]').forEach(function (inp) {
+  inp.addEventListener('change', function () {
+    var f = inp.files[0]; if (!f) return;
+    if (f.size > 65536) { alert('File lebih dari 64 KB'); inp.value = ''; return; }
+    var r = new FileReader();
+    r.onload = function () { document.getElementById(inp.dataset.target).value = r.result; };
+    r.readAsText(f);
+  });
+});
+</script>{{end}}
 </body></html>`))
 
 func envPage(c *gin.Context, status int, d envData) {

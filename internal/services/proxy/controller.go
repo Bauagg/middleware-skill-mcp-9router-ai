@@ -14,12 +14,14 @@ import (
 
 	"github.com/Bauagg/middleware-skill-ai/internal/clients"
 	"github.com/Bauagg/middleware-skill-ai/internal/logger"
+	"github.com/Bauagg/middleware-skill-ai/internal/pkg/attachment"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/userctx"
 )
 
 // maxBodyBytes membatasi body chat completions yang dibaca ke memori
-// (body harus dibaca penuh karena perlu diubah).
-const maxBodyBytes = 20 << 20
+// (body harus dibaca penuh karena perlu diubah). Cukup untuk beberapa
+// lampiran gambar/file dalam base64.
+const maxBodyBytes = 50 << 20
 
 // Controller menangani request HTTP untuk proxy.
 type Controller struct {
@@ -80,7 +82,7 @@ func (h *Controller) Handle(c *gin.Context) {
 	if len(prepared.ToolNames) > 0 {
 		result = h.service.RunWithTools(c.Writer, c.Request, prepared)
 	} else {
-		result = h.service.Forward(c.Writer, c.Request)
+		result = h.service.ForwardChat(c.Writer, c.Request, prepared)
 	}
 	h.service.RecordUsage(prepared, result, time.Since(start))
 	h.service.Learn(c.Request.Context(), prepared)
@@ -99,6 +101,13 @@ func (h *Controller) injectSkill(c *gin.Context) (*Prepared, bool) {
 		c.Data(status, "application/json", clients.OpenAIErrorBody(msg, "invalid_request_error"))
 		c.Abort()
 		return nil, false
+	}
+
+	// lampiran file (PDF, Word, Excel, CSV, ...) dibaca menjadi teks;
+	// gambar diteruskan apa adanya ke model
+	if expanded, n, err := attachment.Expand(raw); err == nil && n > 0 {
+		raw = expanded
+		logger.Info("lampiran file dibaca menjadi teks", zap.Int("files", n))
 	}
 
 	// bila error, prepared tetap berisi body asli (dan model/stream yang terbaca)

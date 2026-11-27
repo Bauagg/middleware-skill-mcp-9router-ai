@@ -125,6 +125,27 @@ services:
         max-size: "5m"
         max-file: "2"
 
+  # browser untuk login akun AI (Google, ChatGPT, ...) dari halaman "Akun AI" FE: layarnya
+  # tampil di FE lewat noVNC (diteruskan middleware), sesinya diambil middleware
+  # lewat DevTools lalu jendela login dibuang. Hanya di network default (tidak
+  # terjangkau container MCP); port hanya dibuka di 127.0.0.1 untuk middleware
+  # yang dijalankan di luar Docker (go run di laptop).
+  login-browser:
+    build: ./docker/login-browser
+    image: middleware-login-browser:latest
+    container_name: login-browser
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9333:9333" # DevTools
+      - "127.0.0.1:6090:6090" # noVNC (websockify)
+    shm_size: 256m
+    mem_limit: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
   # hanya membangun image runner untuk MCP dari GitHub (git, Node 22, pnpm,
   # Python, uv, supergateway), lalu langsung selesai. Container MCP dibuat
   # middleware dari image ini.

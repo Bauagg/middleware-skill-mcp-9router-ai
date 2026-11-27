@@ -33,6 +33,7 @@ type GeneratedImage struct {
 	Data          []byte
 	MIME          string // image/png, image/jpeg, image/webp
 	RevisedPrompt string // prompt yang dipakai provider (bila dilaporkan)
+	Model         string // model yang sebenarnya membuat gambar, bila berbeda dari yang diminta
 }
 
 // ImageClient memanggil endpoint pembuat gambar berformat OpenAI

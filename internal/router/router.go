@@ -25,6 +25,7 @@ import (
 	"github.com/Bauagg/middleware-skill-ai/internal/logger"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/jwtauth"
 	"github.com/Bauagg/middleware-skill-ai/internal/pkg/secretbox"
+	"github.com/Bauagg/middleware-skill-ai/internal/services/aiaccount"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/auth"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/contextpack"
 	"github.com/Bauagg/middleware-skill-ai/internal/services/eval"
@@ -53,6 +54,7 @@ func Register(r *gin.Engine, db *gorm.DB, cfg *config.Config, tokens *jwtauth.Is
 		&contextpack.ContextPack{}, &memorynote.MemoryNote{},
 		&mcp.Credential{}, &mcp.UserServer{}, &imagegen.GeneratedImage{},
 		&auth.User{}, &mcpinstall.Install{}, &mcpinstall.Instance{},
+		&aiaccount.Provider{}, &aiaccount.Account{}, &aiaccount.GeneratedVideo{},
 	); err != nil {
 		logger.Fatal("migrasi database gagal", zap.Error(err))
 	}
@@ -163,8 +165,11 @@ func Register(r *gin.Engine, db *gorm.DB, cfg *config.Config, tokens *jwtauth.Is
 	// MCP: middleware menjadi klien MCP (Figma, Canva, ...) karena 9Router tidak bisa
 	mcpService := newMCP(cfg, db, redis)
 	mcp.RegisterRoutes(api.Group("/mcp"), mcp.NewController(mcpService))
+	// akun AI user (Gemini, ChatGPT, API kompatibel OpenAI, ...): gambar dan
+	// video dengan kuota akun itu
+	aiService := newAIAccounts(cfg, db, r, api)
 	// pembuat gambar lewat chat: tool generate_image + penyaji /images/<nama>
-	imageService := newImageGen(cfg, db, r, api)
+	imageService := newImageGen(cfg, db, r, api, aiService)
 
 	// sumber tool untuk model: MCP dan pembuat gambar (masing-masing boleh mati)
 	var sources proxy.ToolSources
@@ -173,6 +178,9 @@ func Register(r *gin.Engine, db *gorm.DB, cfg *config.Config, tokens *jwtauth.Is
 	go mcpService.Run(context.Background())
 	if imageService.Enabled() {
 		sources = append(sources, imageService)
+	}
+	if aiService.Enabled() {
+		sources = append(sources, aiService) // tool generate_video
 	}
 	// bantu-sambung lewat chat: status server MCP (mcp.json) + link login
 	sources = append(sources, mcp.NewConnectTool(mcpService))
@@ -209,6 +217,11 @@ func Register(r *gin.Engine, db *gorm.DB, cfg *config.Config, tokens *jwtauth.Is
 	}
 
 	// proxy ke 9Router: client OpenAI-compatible cukup mengarah ke middleware ini
+	// akun AI user menjawab chat bila 9Router-nya habis atau error
+	var fallback proxy.Fallback
+	if aiService.Enabled() {
+		fallback = aiService
+	}
 	proxyService := proxy.NewService(proxy.Deps{
 		Selector:     indexService,
 		Renderer:     skillService,
@@ -218,6 +231,7 @@ func Register(r *gin.Engine, db *gorm.DB, cfg *config.Config, tokens *jwtauth.Is
 		ContextPacks: packService,
 		Memory:       noteService,
 		Tools:        tools,
+		Fallback:     fallback,
 		ToolMaxSteps: cfg.MCP.MaxSteps,
 		Budgets:      cfg.Skill.Budgets,
 	})
@@ -246,17 +260,54 @@ func newRedis(cfg *config.Config) *clients.Redis {
 
 // newImageGen menyiapkan pembuat gambar. Model gambar diambil dari akun
 // 9Router user saat dibutuhkan; tool hanya ditawarkan bila akun itu punya.
-func newImageGen(cfg *config.Config, db *gorm.DB, r *gin.Engine, api *gin.RouterGroup) *imagegen.Service {
+// Akun AI user (bila ada) dicoba lebih dulu, 9Router user jadi cadangan.
+func newImageGen(cfg *config.Config, db *gorm.DB, r *gin.Engine, api *gin.RouterGroup, ai *aiaccount.Service) *imagegen.Service {
 	repo, err := imagegen.NewRepository(cfg.Image.Path, db)
 	if err != nil {
 		logger.Fatal("folder gambar tidak bisa dibuat", zap.String("path", cfg.Image.Path), zap.Error(err))
 	}
-	svc := imagegen.NewService(clients.NewImageClient(cfg.Router.AllowPrivate), repo, imagegen.Options{
+	gen := clients.NewImageClient(cfg.Router.AllowPrivate)
+	var source imagegen.Generator = gen
+	if ai.Enabled() {
+		source = ai.NewImageSource(gen)
+	}
+	svc := imagegen.NewService(source, repo, imagegen.Options{
 		Size:    cfg.Image.Size,
 		BaseURL: cfg.App.BaseURL,
 		Timeout: cfg.Image.Timeout,
 	})
 	imagegen.RegisterRoutes(r, api, imagegen.NewController(svc))
+	return svc
+}
+
+// newAIAccounts menyiapkan akun AI user. Rahasia akun (cookie, API key)
+// disimpan terenkripsi dengan MCP_TOKEN_KEY; tanpa kunci itu fitur mati.
+func newAIAccounts(cfg *config.Config, db *gorm.DB, r *gin.Engine, api *gin.RouterGroup) *aiaccount.Service {
+	repo, err := aiaccount.NewRepository(db, aiaccount.VideoPath)
+	if err != nil {
+		logger.Fatal("folder video tidak bisa dibuat", zap.String("path", aiaccount.VideoPath), zap.Error(err))
+	}
+	if err := repo.Migrate(); err != nil {
+		logger.Fatal("migrasi akun AI gagal", zap.Error(err))
+	}
+	var box *secretbox.Box
+	if cfg.MCP.TokenKey != "" {
+		if box, err = secretbox.New(cfg.MCP.TokenKey); err != nil {
+			logger.Fatal("MCP_TOKEN_KEY tidak valid", zap.Error(err))
+		}
+	}
+	// alamat API provider diisi admin, jadi boleh menuju jaringan internal
+	svc := aiaccount.NewService(repo, box, cfg.App.BaseURL, clients.NewImageClient(true))
+	if err := svc.Seed(context.Background()); err != nil {
+		logger.Fatal("provider AI bawaan gagal dibuat", zap.Error(err))
+	}
+	aiaccount.RegisterRoutes(r, api, aiaccount.NewController(svc))
+	if svc.Enabled() {
+		svc.Start(context.Background())
+		logger.Info("akun AI aktif")
+	} else {
+		logger.Info("MCP_TOKEN_KEY kosong: akun AI dimatikan")
+	}
 	return svc
 }
 

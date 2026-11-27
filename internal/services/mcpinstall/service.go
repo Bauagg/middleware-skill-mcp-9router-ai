@@ -62,7 +62,7 @@ const (
 	maxRepoBytes   = 150 << 20
 	maxFileBytes   = 20 << 20
 	maxEnvKeys     = 30
-	maxEnvValueLen = 4096
+	maxEnvValueLen = 64 << 10 // cukup untuk kubeconfig atau sertifikat
 	probeEvery     = 5 * time.Second
 	reconcileDelay = 15 * time.Second
 )
@@ -358,22 +358,25 @@ func inspectRepo(dir string) *Analysis {
 	}
 	a.HasDockerfile = exists("Dockerfile")
 
+	envFile := ""
 	for _, name := range []string{".env.example", ".env.sample", ".env.template", "example.env", "env.example"} {
 		if keys := envKeysFrom(filepath.Join(dir, name)); len(keys) > 0 {
-			a.EnvExample = keys
+			a.EnvExample, envFile = keys, filepath.Join(dir, name)
 			break
 		}
 	}
+	readme := ""
 	for _, name := range []string{"README.md", "readme.md", "README.MD", "Readme.md", "README"} {
 		if raw, err := os.ReadFile(filepath.Join(dir, name)); err == nil {
 			r := []rune(string(raw))
 			if len(r) > readmeRunes {
 				r = append(r[:readmeRunes], []rune("\n[... README dipotong]")...)
 			}
-			a.Readme = string(r)
+			a.Readme, readme = string(r), string(raw)
 			break
 		}
 	}
+	a.EnvHints = scanEnv(dir, envFile, readme)
 	return a
 }
 
@@ -486,12 +489,13 @@ func (s *Service) Submit(ctx context.Context, user string, in SubmitInput) (*Vie
 	}
 	kw, _ := json.Marshal(in.Keywords)
 	ek, _ := json.Marshal(envKeys)
+	eg, _ := json.Marshal(cleanGuide(envKeys, in.EnvGuide))
 
 	row := &Install{
 		UserID: user, Name: name, RepoURL: canonicalURL(owner, repo), Owner: owner, Repo: repo,
 		CommitSHA: m.CommitSHA, Runtime: inspectRepo(s.folder(owner, repo)).Runtime,
 		InstallCommand: strings.TrimSpace(in.InstallCommand), StartCommand: start,
-		Transport: transport, HTTPPath: httpPath, Keywords: string(kw), EnvKeys: string(ek),
+		Transport: transport, HTTPPath: httpPath, Keywords: string(kw), EnvKeys: string(ek), EnvGuide: string(eg),
 		Purpose: strings.TrimSpace(in.Purpose), Global: admin, PerUser: admin && !*in.Shared,
 		Status: StatusPendingReview,
 	}
@@ -674,7 +678,7 @@ func (s *Service) SetEnv(ctx context.Context, user, id string, values map[string
 // mergeEnv menggabungkan nilai baru ke data rahasia terenkripsi.
 func (s *Service) mergeEnv(row *Install, current string, values map[string]string) (string, bool, error) {
 	allowed := map[string]bool{}
-	for _, k := range decodeList(row.EnvKeys) {
+	for _, k := range userKeys(decodeList(row.EnvKeys)) {
 		allowed[k] = true
 	}
 	env, err := s.decrypt(current)
@@ -742,7 +746,7 @@ func (s *Service) decrypt(enc string) (map[string]string, error) {
 func (s *Service) missing(row *Install, enc string) []string {
 	env, _ := s.decrypt(enc)
 	out := []string{}
-	for _, k := range decodeList(row.EnvKeys) {
+	for _, k := range userKeys(decodeList(row.EnvKeys)) {
 		if env[k] == "" {
 			out = append(out, k)
 		}
@@ -818,7 +822,7 @@ func (s *Service) Start(ctx context.Context, scope, user, id string) (*View, err
 			return nil, err
 		}
 		if miss := s.missing(row, inst.EnvEnc); len(miss) > 0 {
-			return nil, apperror.NewBadRequest("data rahasia milikmu belum lengkap: " + strings.Join(miss, ", ") + "; isi lewat link form")
+			return nil, apperror.NewBadRequest("data rahasia milikmu belum lengkap: " + labelList(miss) + "; isi lewat link form")
 		}
 		if err := s.repo.UpdateInstance(ctx, inst.ID, map[string]any{"status": StatusApproved, "error": ""}); err != nil {
 			return nil, err
@@ -831,7 +835,7 @@ func (s *Service) Start(ctx context.Context, scope, user, id string) (*View, err
 		return nil, apperror.NewForbidden("Hanya admin atau yang memasang yang bisa menjalankan MCP ini")
 	}
 	if miss := s.missing(row, row.EnvEnc); len(miss) > 0 {
-		return nil, apperror.NewBadRequest("data rahasia belum lengkap: " + strings.Join(miss, ", "))
+		return nil, apperror.NewBadRequest("data rahasia belum lengkap: " + labelList(miss))
 	}
 	if err := s.repo.Update(ctx, row.ID, map[string]any{"status": StatusApproved, "error": ""}); err != nil {
 		return nil, err
@@ -959,7 +963,12 @@ func (s *Service) Logs(ctx context.Context, scope, user, id string) (string, err
 }
 
 func (s *Service) view(ctx context.Context, row *Install, viewer string) *View {
-	v := &View{Install: row, Keywords: decodeList(row.Keywords), EnvKeys: decodeList(row.EnvKeys), EnvSet: []string{}}
+	// PORT/TRANSPORT diisi middleware sendiri: tidak ditampilkan ke user
+	keys := userKeys(decodeList(row.EnvKeys))
+	var stored map[string]EnvGuide
+	_ = json.Unmarshal([]byte(row.EnvGuide), &stored)
+	guide := guideFor(keys, stored)
+	v := &View{Install: row, Keywords: decodeList(row.Keywords), EnvKeys: keys, EnvGuide: guide, EnvLabels: labelsOf(guide), EnvSet: []string{}}
 	enc := row.EnvEnc
 	if row.PerUser {
 		enc = ""
@@ -984,6 +993,24 @@ func (s *Service) view(ctx context.Context, row *Install, viewer string) *View {
 		v.EnvURL = s.EnvURL(row.ID, viewer)
 	}
 	return v
+}
+
+// missingLabels menyebut isian yang belum diisi dengan nama yang dipahami
+// user (mis. "Koneksi database"), bukan nama variabel.
+func missingLabels(v *View) string {
+	out := make([]string, len(v.EnvMissing))
+	for i, k := range v.EnvMissing {
+		out[i] = v.EnvLabels[k]
+	}
+	return strings.Join(out, ", ")
+}
+
+func labelList(keys []string) string {
+	out := make([]string, len(keys))
+	for i, k := range keys {
+		out[i] = envLabel(k)
+	}
+	return strings.Join(out, ", ")
 }
 
 func decodeList(raw string) []string {
@@ -1198,9 +1225,17 @@ func containerEnv(row *Install, secrets map[string]string) []string {
 		"MCP_PORT=" + strconv.Itoa(containerPort),
 		"PORT=" + strconv.Itoa(containerPort),
 	}
+	// pengaturan server yang dibaca repo (TRANSPORT, HTTP_PORT, BIND_HOST, ...)
+	for _, k := range decodeList(row.EnvKeys) {
+		if v, ok := serverEnv(k, row.Transport, containerPort); ok {
+			env = append(env, k+"="+v)
+		}
+	}
 	keys := make([]string, 0, len(secrets))
 	for k := range secrets {
-		keys = append(keys, k)
+		if !autoEnv[k] { // nilai lama dari sebelum PORT/TRANSPORT diatur otomatis
+			keys = append(keys, k)
+		}
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
@@ -1304,8 +1339,16 @@ func NewTool(svc *Service) *Tool {
 				"transport":       map[string]any{"type": "string", "enum": []string{"stdio", "http"}, "description": "submit: bawaan stdio (lebih aman dipakai)"},
 				"http_path":       map[string]any{"type": "string", "description": "submit, transport http: path endpoint, bawaan /mcp"},
 				"env_keys":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "submit: NAMA variabel rahasia yang dibutuhkan (mis. DSN), tanpa nilainya"},
-				"keywords":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "submit: kata kunci bahasa user untuk memilih tool server ini"},
-				"purpose":         map[string]any{"type": "string", "description": "submit: untuk apa server ini (dibaca admin saat menyetujui)"},
+				"env_guide": map[string]any{"type": "object", "description": "submit, WAJIB untuk setiap env_keys: {NAMA: {label, help, example, multiline}} " +
+					"dalam bahasa Indonesia untuk user awam (bukan programmer), ditulis dari cara variabel itu dipakai di kode. Ditampilkan di form isian.",
+					"additionalProperties": map[string]any{"type": "object", "properties": map[string]any{
+						"label":     map[string]any{"type": "string", "description": "nama isian awam, mis. Alamat server Kubernetes"},
+						"help":      map[string]any{"type": "string", "description": "ini apa dan cara mendapatkannya, 1-3 kalimat"},
+						"example":   map[string]any{"type": "string", "description": "contoh isian palsu dengan format yang benar"},
+						"multiline": map[string]any{"type": "boolean", "description": "true untuk isi file: sertifikat, kubeconfig, JSON"},
+					}}},
+				"keywords": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "submit: kata kunci bahasa user untuk memilih tool server ini"},
+				"purpose":  map[string]any{"type": "string", "description": "submit: untuk apa server ini (dibaca admin saat menyetujui)"},
 				"shared": map[string]any{"type": "boolean", "description": "submit, WAJIB bila yang meminta admin dan HARUS ditanyakan ke admin dulu: " +
 					"true = sharing, satu server berisi data rahasia admin dipakai semua user (mis. database perusahaan); " +
 					"false = tidak sharing, tiap user mengisi data rahasianya sendiri dan mendapat server sendiri. Abaikan untuk user biasa."},
@@ -1398,7 +1441,7 @@ func (t *Tool) install(ctx context.Context, user, args string) llmtool.Result {
 	}
 	if len(v.EnvMissing) > 0 && v.EnvURL != "" {
 		fmt.Fprintf(&b, "Data rahasia yang perlu diisi: %s.\nLink form (khusus user ini, berlaku 24 jam, tampilkan sebagai link markdown): %s\n"+
-			"Minta user mengisi di link itu, JANGAN di chat.\n", strings.Join(v.EnvMissing, ", "), v.EnvURL)
+			"Minta user mengisi di link itu, JANGAN di chat.\n", missingLabels(v), v.EnvURL)
 	}
 	if v.Status == StatusApproved && len(v.EnvMissing) == 0 && !v.PerUser {
 		b.WriteString("Server sedang di-clone, di-install, dan dijalankan di container (bisa beberapa menit). " +
@@ -1522,11 +1565,49 @@ func describeAnalysis(a *Analysis, admin bool) string {
 	if a.Readme != "" {
 		b.WriteString("\nREADME (potongan):\n" + a.Readme + "\n")
 	}
+	if len(a.EnvHints) > 0 {
+		b.WriteString("\nVariabel lingkungan yang dibaca kode (bahan env_keys dan env_guide):\n")
+		for _, h := range a.EnvHints {
+			fmt.Fprintf(&b, "- %s", h.Key)
+			switch {
+			case h.Auto:
+				b.WriteString(" [pengaturan server MCP, diisi middleware otomatis: JANGAN masukkan ke env_keys]")
+			case h.Key == "HOST" || h.Key == "HOSTNAME":
+				b.WriteString(" [biasanya alamat tempat server MCP sendiri mendengarkan: JANGAN masukkan ke env_keys, " +
+					"kecuali kode di bawah jelas memakainya sebagai alamat layanan tujuan milik user]")
+			}
+			b.WriteString("\n")
+			if h.Comment != "" {
+				fmt.Fprintf(&b, "    komentar .env.example: %s\n", h.Comment)
+			}
+			if h.Example != "" {
+				fmt.Fprintf(&b, "    contoh .env.example: %s\n", h.Example)
+			}
+			for _, c := range append(h.Code, h.Readme...) {
+				fmt.Fprintf(&b, "    %s\n", c)
+			}
+		}
+	}
 	b.WriteString("\nLingkungan container: Debian dengan git, Node 22 (npm, pnpm, yarn lewat corepack), Python 3 + uv, " +
 		"folder kerja /app berisi repo, port 8000. Tanpa akses ke file VPS.\n" +
 		"Langkah berikutnya: susun name, install_command, start_command (utamakan transport stdio), dan env_keys " +
-		"(NAMA saja, mis. DSN; nilai bisa dirujuk di start_command sebagai \"$DSN\"). Jelaskan rencana itu ke user dengan singkat " +
-		"dan minta konfirmasi. Setelah user setuju, panggil action=submit.")
+		"(NAMA saja, hanya yang benar-benar wajib agar server bisa dipakai; nilai bisa dirujuk di start_command sebagai \"$NAMA\"). " +
+		"PORT dan TRANSPORT diisi middleware otomatis: jangan masukkan ke env_keys. Koneksi database cukup SATU variabel (mis. DSN): " +
+		"di form, user menjelaskan database-nya dengan kata-kata sendiri dan middleware yang menyusun DSN-nya.\n" +
+		"WAJIB isi env_guide untuk SETIAP env_keys, berdasarkan cara variabel itu dipakai di kode/README di atas. Pembacanya " +
+		"pemilik usaha kecil, BUKAN programmer: label = nama isian dalam bahasa Indonesia awam (mis. \"Alamat server Kubernetes\", " +
+		"\"Token akses GitHub\"); help = 1-3 kalimat: ini apa, dipakai untuk apa, dan langkah konkret mendapatkannya (menu mana di " +
+		"layanan itu, atau minta ke siapa), tanpa istilah teknis yang tidak perlu; example = contoh isian PALSU dengan format persis " +
+		"yang diminta kode (untuk koneksi database: kalimat seperti \"PostgreSQL, alamat db.tokoku.com, user admin, password ..., " +
+		"nama database toko\"); multiline = true untuk isi file (sertifikat, kubeconfig, kunci PEM, JSON kredensial). " +
+		"Sesuaikan dengan konteks MCP ini: jelaskan hanya hal yang memang dibutuhkan layanan tujuannya. Bila layanan tujuan butuh " +
+		"port (database, SSH, email SMTP/IMAP, Redis, FTP, ...), jelaskan port itu dengan port yang umum dipakai layanan tersebut " +
+		"dan masukkan ke example; bila tidak butuh (mis. layanan yang cukup alamat https dan token), jangan menyebut port. " +
+		"Pengaturan server MCP itu sendiri (port/alamat tempat ia mendengarkan, mis. PORT, HTTP_PORT, HOST, BIND_HOST, transport, " +
+		"path HTTP) diatur middleware: JANGAN masukkan ke env_keys, jangan tanyakan, dan jangan sebut ke user, karena berbahaya " +
+		"bila diketahui. Yang boleh ditanyakan hanya port/alamat milik layanan user. Jangan menjelaskan DSN atau nama variabel ke user di chat, dan " +
+		"jangan minta user menyusun DSN. " +
+		"Jelaskan rencana itu ke user dengan singkat (dengan bahasa awam) dan minta konfirmasi. Setelah user setuju, panggil action=submit.")
 	if !admin {
 		b.WriteString(" Beri tahu user bahwa pemasangannya perlu disetujui admin dulu dan hanya berlaku untuk dirinya.")
 	} else {
@@ -1555,7 +1636,7 @@ func describeInstall(v *View) string {
 		s += ", kamu belum memakainya (minta env_link untuk mulai)"
 	}
 	if len(v.EnvMissing) > 0 && (v.PerUser || !v.Global || v.EnvURL != "") {
-		s += ", data rahasia belum diisi: " + strings.Join(v.EnvMissing, ", ")
+		s += ", data rahasia belum diisi: " + missingLabels(v)
 	}
 	if v.Error != "" {
 		s += "\n  error: " + clip(v.Error, 800)

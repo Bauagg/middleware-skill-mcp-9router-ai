@@ -36,7 +36,31 @@ type Result struct {
 
 	// Aborted true bila client memutus koneksi sebelum respons selesai.
 	Aborted bool
+
+	// Fallback true bila 9Router gagal dan responsnya TIDAK diteruskan ke
+	// client (lihat WithFallback): pemanggil wajib menjawab sendiri.
+	// UpstreamError berisi pesan error 9Router-nya.
+	Fallback      bool
+	UpstreamError string
 }
+
+// fallbackKey menandai request yang boleh dijawab pihak lain bila 9Router gagal.
+type fallbackKey struct{}
+
+// WithFallback membuat Forward menahan respons gagal dari 9Router (dan
+// kegagalan menghubunginya) bila accept(status) true: tidak ada yang ditulis
+// ke client, dan Result.Fallback diisi supaya pemanggil menjawab sendiri.
+func WithFallback(ctx context.Context, accept func(status int) bool) context.Context {
+	return context.WithValue(ctx, fallbackKey{}, accept)
+}
+
+func fallbackFrom(ctx context.Context) func(int) bool {
+	f, _ := ctx.Value(fallbackKey{}).(func(int) bool)
+	return f
+}
+
+// errHeldBack: respons gagal ditahan untuk dijawab pihak lain (WithFallback).
+var errHeldBack = errors.New("respons 9Router ditahan untuk cadangan")
 
 // NineRouter adalah klien ke 9Router: meneruskan request apa adanya,
 // mengalirkan responsnya kembali ke client, dan mengamati status serta
@@ -51,9 +75,11 @@ type NineRouter struct {
 // observer menampung hasil pengamatan satu request. Hanya disentuh dari
 // goroutine yang menjalankan ReverseProxy.ServeHTTP, jadi tanpa lock.
 type observer struct {
-	status  int
-	aborted bool
-	sniffer *openai.UsageSniffer
+	status   int
+	aborted  bool
+	sniffer  *openai.UsageSniffer
+	fallback bool
+	upstream string // pesan error 9Router yang ditahan
 }
 
 type observerKey struct{}
@@ -125,6 +151,13 @@ func NewNineRouter(allowPrivate bool) *NineRouter {
 		FlushInterval: -1,
 
 		ModifyResponse: func(resp *http.Response) error {
+			if accept := fallbackFrom(resp.Request.Context()); accept != nil && resp.StatusCode/100 != 2 && accept(resp.StatusCode) {
+				if obs := observerFrom(resp.Request.Context()); obs != nil {
+					raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+					obs.status, obs.fallback, obs.upstream = resp.StatusCode, true, upstreamMessage(raw)
+				}
+				return errHeldBack // ErrorHandler dipanggil, body ditutup proxy
+			}
 			if obs := observerFrom(resp.Request.Context()); obs != nil {
 				obs.status = resp.StatusCode
 				obs.sniffer = openai.NewUsageSniffer(resp.Header.Get("Content-Type"))
@@ -143,6 +176,10 @@ func NewNineRouter(allowPrivate bool) *NineRouter {
 				return // client memutus koneksi, tidak ada yang perlu dibalas
 			}
 
+			if errors.Is(err, errHeldBack) {
+				return // pemanggil yang menjawab (WithFallback)
+			}
+
 			status, typ, msg := http.StatusBadGateway, "bad_gateway", "9Router tidak dapat dihubungi"
 			var ne net.Error
 			if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
@@ -150,6 +187,11 @@ func NewNineRouter(allowPrivate bool) *NineRouter {
 			}
 			if obs != nil {
 				obs.status = status
+			}
+			if accept := fallbackFrom(r.Context()); accept != nil && obs != nil && accept(status) {
+				logger.Warn("9Router gagal, dialihkan ke cadangan", zap.Error(err), zap.String("path", r.URL.Path))
+				obs.fallback, obs.upstream = true, msg
+				return
 			}
 
 			logger.Error("meneruskan ke 9Router gagal", zap.Error(err), zap.String("path", r.URL.Path))
@@ -187,11 +229,24 @@ func (n *NineRouter) Forward(w http.ResponseWriter, req *http.Request) (res Resu
 }
 
 func (o *observer) result() Result {
-	res := Result{Status: o.status, Aborted: o.aborted}
+	res := Result{Status: o.status, Aborted: o.aborted, Fallback: o.fallback, UpstreamError: o.upstream}
 	if o.sniffer != nil {
 		res.Usage = o.sniffer.Usage()
 	}
 	return res
+}
+
+// upstreamMessage mengambil pesan error dari body error 9Router.
+func upstreamMessage(raw []byte) string {
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &e) == nil && e.Error.Message != "" {
+		return innerMessage(e.Error.Message)
+	}
+	return snippet(raw)
 }
 
 // OpenAIErrorBody membuat body error ala OpenAI ({"error":{"message","type"}}).

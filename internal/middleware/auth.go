@@ -106,8 +106,10 @@ func public(c *gin.Context) bool {
 	switch {
 	case p == "/" || p == "/health":
 		return true
-	case strings.HasPrefix(p, "/images/"):
-		return true // link gambar di jawaban chat (nama file acak)
+	case strings.HasPrefix(p, "/images/"), strings.HasPrefix(p, "/videos/"):
+		return true // link gambar/video di jawaban chat (nama file acak)
+	case p == "/api/ai/login/vnc" && c.Query("ticket") != "":
+		return true // layar login Gemini (WebSocket noVNC), tiket diverifikasi di controller
 	case p == "/api/mcp/oauth/callback":
 		return true // dipanggil browser setelah login; user dibawa di state login
 	case strings.HasPrefix(p, "/api/mcp/servers/") && strings.HasSuffix(p, "/connect") && c.Query("sig") != "":

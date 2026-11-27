@@ -41,6 +41,8 @@ type Install struct {
 
 	Keywords string `json:"-" gorm:"type:text"` // JSON array
 	EnvKeys  string `json:"-" gorm:"type:text"` // JSON array nama variabel rahasia yang dibutuhkan
+	// EnvGuide: panduan isian untuk user awam (JSON map nama -> EnvGuide)
+	EnvGuide string `json:"-" gorm:"type:text"`
 	// EnvEnc adalah isi variabel rahasia (JSON map) terenkripsi MCP_TOKEN_KEY.
 	// Tidak pernah dikirim di respons.
 	EnvEnc  string `json:"-" gorm:"type:text"`

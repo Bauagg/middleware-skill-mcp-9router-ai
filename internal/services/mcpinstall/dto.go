@@ -23,6 +23,33 @@ type Analysis struct {
 	EnvExample     []string          `json:"env_example,omitempty"` // nama variabel dari .env.example
 	Readme         string            `json:"readme,omitempty"`      // potongan awal README
 	Files          int               `json:"files"`
+	// EnvHints: hasil membaca kode tentang setiap variabel lingkungan, bahan
+	// panduan isian untuk user.
+	EnvHints []EnvHint `json:"env_hints,omitempty"`
+}
+
+// EnvHint adalah bacaan repo tentang satu variabel lingkungan.
+type EnvHint struct {
+	Key       string   `json:"key"`
+	InExample bool     `json:"in_example"`        // tercantum di .env.example
+	Auto      bool     `json:"auto,omitempty"`    // diisi middleware (PORT, TRANSPORT)
+	Comment   string   `json:"comment,omitempty"` // komentar di atasnya di .env.example
+	Example   string   `json:"example,omitempty"` // contoh nilai di .env.example
+	Code      []string `json:"code,omitempty"`    // "file:baris: potongan kode" yang membacanya
+	Readme    []string `json:"readme,omitempty"`  // baris README yang menyebutnya
+}
+
+// EnvGuide menjelaskan satu isian data akses kepada user awam (pemilik
+// usaha, bukan programmer): ditampilkan di form.
+type EnvGuide struct {
+	Label string `json:"label"` // nama isian, mis. "Alamat server Kubernetes"
+	Help  string `json:"help"`  // apa itu dan cara mendapatkannya
+	// Example: contoh isian (palsu) sesuai format yang dibutuhkan, tampil
+	// sebagai teks samar di dalam kotak isian.
+	Example string `json:"example"`
+	// Multiline: isian panjang (sertifikat, kubeconfig, JSON); form
+	// menyediakan unggah file.
+	Multiline bool `json:"multiline"`
 }
 
 // SubmitInput adalah body POST /api/mcp/installs (dan argumen tool chat).
@@ -34,8 +61,11 @@ type SubmitInput struct {
 	Transport      string   `json:"transport"` // stdio (bawaan) | http
 	HTTPPath       string   `json:"http_path"` // untuk transport http, bawaan /mcp
 	EnvKeys        []string `json:"env_keys"`
-	Keywords       []string `json:"keywords"`
-	Purpose        string   `json:"purpose" binding:"max=1000"`
+	// EnvGuide: panduan setiap isian di EnvKeys untuk user awam (ditulis model
+	// dari hasil membaca kode); yang kosong memakai panduan bawaan.
+	EnvGuide map[string]EnvGuide `json:"env_guide"`
+	Keywords []string            `json:"keywords"`
+	Purpose  string              `json:"purpose" binding:"max=1000"`
 	// Shared wajib dipilih admin: true = satu container berisi data rahasia
 	// admin dipakai semua user; false = tiap user mengisi data rahasianya
 	// sendiri dan mendapat container sendiri. Diabaikan untuk user biasa.
@@ -50,11 +80,15 @@ type ReviewInput struct {
 // View adalah tampilan satu pemasangan untuk API dan chat (tanpa isi rahasia).
 type View struct {
 	*Install
-	Keywords   []string `json:"keywords"`
-	EnvKeys    []string `json:"env_keys"`
-	EnvSet     []string `json:"env_set"`     // variabel rahasia yang sudah diisi (nilainya tidak ditampilkan)
-	EnvMissing []string `json:"env_missing"` // yang belum diisi
-	EnvURL     string   `json:"env_url,omitempty"`
+	Keywords []string `json:"keywords"`
+	EnvKeys  []string `json:"env_keys"`
+	// EnvLabels: nama isian yang mudah dibaca user (mis. DSN -> "Koneksi database")
+	EnvLabels map[string]string `json:"env_labels"`
+	// EnvGuide: panduan setiap isian (label, penjelasan, contoh)
+	EnvGuide   map[string]EnvGuide `json:"env_guide"`
+	EnvSet     []string            `json:"env_set"`     // variabel rahasia yang sudah diisi (nilainya tidak ditampilkan)
+	EnvMissing []string            `json:"env_missing"` // yang belum diisi
+	EnvURL     string              `json:"env_url,omitempty"`
 	// Mine: instance milik user yang melihat (hanya untuk template tidak-sharing).
 	Mine *Instance `json:"my_instance,omitempty"`
 }

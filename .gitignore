@@ -21,6 +21,7 @@ logs/*.log
 
 # Gambar hasil generate lewat chat (dibuat otomatis)
 /images/
+/videos/
 
 # Clone repo MCP dari GitHub yang dipasang lewat chat (dibuat otomatis)
 /open_source_mcp/

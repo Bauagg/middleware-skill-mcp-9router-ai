@@ -214,6 +214,9 @@ func (s *Service) generate(ctx context.Context, prompt string) (*clients.Generat
 		img, err := s.gen.Generate(attemptCtx, model, prompt, s.opt.Size)
 		cancel()
 		if err == nil {
+			if img.Model != "" {
+				model = img.Model
+			}
 			return img, model, nil
 		}
 		if ctx.Err() != nil {
@@ -261,13 +264,14 @@ func (s *Service) models(ctx context.Context) ([]string, error) {
 }
 
 // account mengenali akun 9Router dari hash alamat + key-nya (key asli tidak
-// disimpan). Key yang sama di 9Router berbeda dianggap akun berbeda.
+// disimpan). Key yang sama di 9Router berbeda dianggap akun berbeda. User ikut
+// dihitung karena daftar model juga memuat akun Gemini milik user itu.
 func account(ctx context.Context) string {
 	key, base := userctx.RouterKey(ctx), userctx.RouterURL(ctx)
 	if key == "" || base == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(base + "\x00" + key))
+	sum := sha256.Sum256([]byte(base + "\x00" + key + "\x00" + userctx.From(ctx)))
 	return hex.EncodeToString(sum[:8]) + "/"
 }
 
